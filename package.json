@@ -1,0 +1,14 @@
+{
+  "name": "jbook",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "book": "node scripts/book.js",
+    "pw:install": "playwright install --with-deps chromium",
+    "pw:codegen": "playwright codegen https://juliusbaer.smartenspaces.com/spacemanagementV2/#/login"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}

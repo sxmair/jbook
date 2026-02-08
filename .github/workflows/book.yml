@@ -1,0 +1,36 @@
+name: Auto book seat
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 16 * * 0-4"  # 16:00 UTC Sun-Thu = 00:00 SGT Mon-Fri
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run booking
+        env:
+          SMARTEN_USER: ${{ secrets.SMARTEN_USER }}
+          SMARTEN_PASS: ${{ secrets.SMARTEN_PASS }}
+          DAYS_AHEAD: "14"
+          SEAT_NUMBER: ${{ secrets.SEAT_NUMBER }}
+          START_TIME_LABEL: ${{ secrets.START_TIME_LABEL }}
+          END_TIME_LABEL: ${{ secrets.END_TIME_LABEL }}
+          HEADFUL: "0"
+        run: node scripts/book-seat.js

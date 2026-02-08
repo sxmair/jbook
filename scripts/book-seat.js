@@ -21,6 +21,10 @@ const START_TIME_LABEL = process.env.START_TIME_LABEL || "09:45 AM";
 const END_TIME_LABEL = process.env.END_TIME_LABEL || "11:59 PM";
 
 const DAYS_AHEAD = Number(process.env.DAYS_AHEAD || "14");
+const SEAT_FALLBACKS = (process.env.SEAT_FALLBACKS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // Debug controls
 const HEADFUL = process.env.HEADFUL === "1";
@@ -394,27 +398,27 @@ function normalizeSeatLabel(label) {
   return (label || "").toString().trim().toLowerCase();
 }
 
-function buildDesiredSeatLabels() {
+function buildDesiredSeatLabels(seatNumber, seatDisplayName) {
   const labels = new Set();
-  if (SEAT_DISPLAY_NAME) labels.add(normalizeSeatLabel(SEAT_DISPLAY_NAME));
-  if (SEAT_NUMBER) {
-    const n = String(SEAT_NUMBER).trim();
+  if (seatDisplayName) labels.add(normalizeSeatLabel(seatDisplayName));
+  if (seatNumber) {
+    const n = String(seatNumber).trim();
     labels.add(normalizeSeatLabel(n));
     labels.add(normalizeSeatLabel(`6-${n}`));
   }
   return labels;
 }
 
-async function resolveSeatFromMap() {
+async function resolveSeatFromMap(seatNumber, { entityId, displayName } = {}) {
   const entities = await waitForMapEntities(30_000);
-  const desired = buildDesiredSeatLabels();
+  const desired = buildDesiredSeatLabels(seatNumber, displayName);
 
-  if (SEAT_ENTITY_ID) {
-    const byId = entities.find((e) => e.id === SEAT_ENTITY_ID);
+  if (entityId) {
+    const byId = entities.find((e) => e.id === entityId);
     if (byId) return byId;
     const fallbackName =
-      SEAT_DISPLAY_NAME || (SEAT_NUMBER ? `6-${SEAT_NUMBER}` : "UNKNOWN");
-    return { id: SEAT_ENTITY_ID, displayName: fallbackName };
+      displayName || (seatNumber ? `6-${seatNumber}` : "UNKNOWN");
+    return { id: entityId, displayName: fallbackName };
   }
 
   for (const e of entities) {
@@ -423,7 +427,7 @@ async function resolveSeatFromMap() {
   }
 
   // fallback: try endsWith for seat number
-  const num = String(SEAT_NUMBER).trim();
+  const num = String(seatNumber || "").trim();
   if (num) {
     const match = entities.find((e) =>
       normalizeSeatLabel(e.displayName).endsWith(`-${num}`)
@@ -432,7 +436,7 @@ async function resolveSeatFromMap() {
   }
 
   throw new Error(
-    `Could not resolve seat "${SEAT_NUMBER}" from map data. Found ${entities.length} entities.`
+    `Could not resolve seat "${seatNumber}" from map data. Found ${entities.length} entities.`
   );
 }
 
@@ -484,7 +488,7 @@ async function bookSeatViaApi(context, { userId, targetLocalDate, seat }) {
   )}`;
 
   logStep(
-    `🚀 Calling booking API for seat ${SEAT_NUMBER} (${seat.displayName}, entityId=${seat.id})...`
+    `🚀 Calling booking API for seat ${seat.displayName} (entityId=${seat.id})...`
   );
 
   // Add browser-like headers (helps some setups)
@@ -516,6 +520,17 @@ async function bookSeatViaApi(context, { userId, targetLocalDate, seat }) {
   logStep(`✅ Booking API returned ${res.status()}`);
   logVerbose(`Response: ${body.slice(0, 1500)}`);
   return body;
+}
+
+function isSeatTakenError(err) {
+  const msg = (err && err.message ? err.message : String(err || "")).toLowerCase();
+  return (
+    msg.includes("got booked by someone else") ||
+    msg.includes("space you were trying to book got booked") ||
+    msg.includes("please try to book another space") ||
+    msg.includes("oops!") ||
+    (msg.includes("booking api failed") && msg.includes("500"))
+  );
 }
 
 /* ----------------------------
@@ -688,21 +703,47 @@ async function bookSeatViaApi(context, { userId, targetLocalDate, seat }) {
     const userId = await waitForCapturedUserId(30_000);
     logStep(`Resolved userId=${userId}`);
 
-    // 7) Resolve seat from map data (unless entity id is provided)
-    const resolvedSeat = await resolveSeatFromMap();
-    logStep(`Resolved seat: ${resolvedSeat.displayName} (id=${resolvedSeat.id})`);
+    // 7) Resolve seat + book (with fallbacks)
+    const seatCandidates = [SEAT_NUMBER, ...SEAT_FALLBACKS];
+    logStep(`Seat candidates: ${seatCandidates.join(", ")}`);
+    let bookedSeat = null;
 
-    // 8) Book seat via API
-    if (Object.keys(capturedAmenityHeaders).length === 0) {
-      logStep("⚠️ No amenity headers captured; booking may fail.");
+    for (let i = 0; i < seatCandidates.length; i++) {
+      const seatNum = seatCandidates[i];
+      const resolvedSeat = await resolveSeatFromMap(seatNum, {
+        entityId: i === 0 ? SEAT_ENTITY_ID : null,
+        displayName: i === 0 ? SEAT_DISPLAY_NAME : null,
+      });
+      logStep(`Resolved seat: ${resolvedSeat.displayName} (id=${resolvedSeat.id})`);
+
+      if (Object.keys(capturedAmenityHeaders).length === 0) {
+        logStep("⚠️ No amenity headers captured; booking may fail.");
+      }
+
+      try {
+        await bookSeatViaApi(context, {
+          userId,
+          targetLocalDate,
+          seat: resolvedSeat,
+        });
+        bookedSeat = resolvedSeat;
+        break;
+      } catch (e) {
+        if (i < seatCandidates.length - 1 && isSeatTakenError(e)) {
+          logStep(
+            `Seat ${resolvedSeat.displayName} just got booked. Trying next fallback...`
+          );
+          continue;
+        }
+        throw e;
+      }
     }
-    await bookSeatViaApi(context, {
-      userId,
-      targetLocalDate,
-      seat: resolvedSeat,
-    });
 
-    logStep(`✅ Completed booking via API (seat ${SEAT_NUMBER}).`);
+    if (!bookedSeat) {
+      throw new Error("No seat could be booked from the fallback list.");
+    }
+
+    logStep(`✅ Completed booking via API (seat ${bookedSeat.displayName}).`);
 
   } catch (e) {
     console.error(`[${ts()}] ❌ Failed:`, e);

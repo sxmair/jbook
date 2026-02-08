@@ -28,15 +28,9 @@ jobs:
         env:
           SMARTEN_USER: ${{ secrets.SMARTEN_USER }}
           SMARTEN_PASS: ${{ secrets.SMARTEN_PASS }}
-          SEAT_LABEL: ${{ secrets.SEAT_LABEL }}
-          START_TIME: ${{ secrets.START_TIME }}
-          BOOK_FOR: ${{ secrets.BOOK_FOR }}
+          DAYS_AHEAD: "14"
+          SEAT_NUMBER: ${{ secrets.SEAT_NUMBER }}
+          START_TIME_LABEL: ${{ secrets.START_TIME_LABEL }}
+          END_TIME_LABEL: ${{ secrets.END_TIME_LABEL }}
+          HEADFUL: "0"
         run: node scripts/book-seat.js
-
-      - name: Upload debug artifacts (only if failed)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: |
-            failure.png

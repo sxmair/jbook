@@ -6,10 +6,12 @@ const LOGIN_URL =
 const USER = process.env.SMARTEN_USER;
 const PASS = process.env.SMARTEN_PASS;
 
-// Desired seat 171 backend entity info (from your captured payload)
+// Desired seat info (entityId is optional now; we'll resolve if missing)
 const SEAT_NUMBER = process.env.SEAT_NUMBER || "171";
-const SEAT_ENTITY_ID = Number(process.env.SEAT_ENTITY_ID || "855"); // 6-171
-const SEAT_DISPLAY_NAME = process.env.SEAT_DISPLAY_NAME || "6-171";
+const SEAT_ENTITY_ID = process.env.SEAT_ENTITY_ID
+  ? Number(process.env.SEAT_ENTITY_ID)
+  : null;
+const SEAT_DISPLAY_NAME = process.env.SEAT_DISPLAY_NAME || null;
 
 const BUILDING_ID = Number(process.env.BUILDING_ID || "10");
 const BUILDING_NAME = process.env.BUILDING_NAME || "ONE@CHANGI CITY";
@@ -47,6 +49,7 @@ function logVerbose(msg) {
  * Auth header capture
  * ---------------------------- */
 let capturedAmenityHeaders = {};
+let lastMapEntities = [];
 
 function sanitizeHeaders(headers) {
   const deny = new Set([
@@ -307,9 +310,136 @@ async function waitForCapturedUserId(timeoutMs = 30_000) {
 }
 
 /* ----------------------------
+ * Seat lookup from map data
+ * ---------------------------- */
+function extractEntitiesFromMapValue(value) {
+  const out = [];
+  const seen = new Set();
+
+  const addEntity = (e) => {
+    if (!e) return;
+    if (typeof e.id === "number" && typeof e.displayName === "string") {
+      if (!seen.has(e.id)) {
+        seen.add(e.id);
+        out.push({ id: e.id, displayName: e.displayName });
+      }
+    }
+  };
+
+  const addFromArray = (arr) => {
+    if (!Array.isArray(arr)) return;
+    for (const e of arr) addEntity(e);
+  };
+
+  // Prefer known top-level arrays in map payload
+  if (value && typeof value === "object") {
+    const knownKeys = [
+      "availableEntities",
+      "occupiedEntities",
+      "occupiedNotCheckedInEntities",
+      "socialDistancedEntities",
+      "disabledEntities",
+      "blockedEntities",
+      "allEntities",
+    ];
+    for (const k of knownKeys) {
+      if (Array.isArray(value[k])) addFromArray(value[k]);
+    }
+  }
+
+  // Fallback: deep scan for arrays with entity-like objects
+  if (out.length === 0) {
+    const stack = [value];
+    let steps = 0;
+    while (stack.length && steps < 8000) {
+      const cur = stack.pop();
+      steps += 1;
+      if (!cur) continue;
+      if (Array.isArray(cur)) {
+        for (const item of cur) {
+          if (item && typeof item === "object" && "id" in item && "displayName" in item) {
+            addEntity(item);
+          } else {
+            stack.push(item);
+          }
+        }
+        continue;
+      }
+      if (typeof cur === "object") {
+        for (const v of Object.values(cur)) stack.push(v);
+      }
+    }
+  }
+
+  return out;
+}
+
+function mergeEntities(existing, next) {
+  const map = new Map();
+  for (const e of existing || []) map.set(e.id, e);
+  for (const e of next || []) map.set(e.id, e);
+  return Array.from(map.values());
+}
+
+async function waitForMapEntities(timeoutMs = 30_000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (lastMapEntities.length > 0) return lastMapEntities;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error("Timed out waiting for map entities from availability data.");
+}
+
+function normalizeSeatLabel(label) {
+  return (label || "").toString().trim().toLowerCase();
+}
+
+function buildDesiredSeatLabels() {
+  const labels = new Set();
+  if (SEAT_DISPLAY_NAME) labels.add(normalizeSeatLabel(SEAT_DISPLAY_NAME));
+  if (SEAT_NUMBER) {
+    const n = String(SEAT_NUMBER).trim();
+    labels.add(normalizeSeatLabel(n));
+    labels.add(normalizeSeatLabel(`6-${n}`));
+  }
+  return labels;
+}
+
+async function resolveSeatFromMap() {
+  const entities = await waitForMapEntities(30_000);
+  const desired = buildDesiredSeatLabels();
+
+  if (SEAT_ENTITY_ID) {
+    const byId = entities.find((e) => e.id === SEAT_ENTITY_ID);
+    if (byId) return byId;
+    const fallbackName =
+      SEAT_DISPLAY_NAME || (SEAT_NUMBER ? `6-${SEAT_NUMBER}` : "UNKNOWN");
+    return { id: SEAT_ENTITY_ID, displayName: fallbackName };
+  }
+
+  for (const e of entities) {
+    const dn = normalizeSeatLabel(e.displayName);
+    if (desired.has(dn)) return e;
+  }
+
+  // fallback: try endsWith for seat number
+  const num = String(SEAT_NUMBER).trim();
+  if (num) {
+    const match = entities.find((e) =>
+      normalizeSeatLabel(e.displayName).endsWith(`-${num}`)
+    );
+    if (match) return match;
+  }
+
+  throw new Error(
+    `Could not resolve seat "${SEAT_NUMBER}" from map data. Found ${entities.length} entities.`
+  );
+}
+
+/* ----------------------------
  * API booking (use context.request so cookies are shared)
  * ---------------------------- */
-async function bookSeatViaApi(context, { userId, targetLocalDate }) {
+async function bookSeatViaApi(context, { userId, targetLocalDate, seat }) {
   const dateStartUtcMs = utcMidnightMsForLocalDate(targetLocalDate);
   const endMinutes = parseTimeLabelToMinutes(END_TIME_LABEL);
   const endTimeMs = dateStartUtcMs + endMinutes * 60_000;
@@ -319,8 +449,8 @@ async function bookSeatViaApi(context, { userId, targetLocalDate }) {
       requestDetails: {
         entityInfos: [
           {
-            id: SEAT_ENTITY_ID,
-            displayName: SEAT_DISPLAY_NAME,
+            id: seat.id,
+            displayName: seat.displayName,
             specialRequest: [],
             serviceRequestEnabled: false,
           },
@@ -354,7 +484,7 @@ async function bookSeatViaApi(context, { userId, targetLocalDate }) {
   )}`;
 
   logStep(
-    `🚀 Calling booking API for seat ${SEAT_NUMBER} (${SEAT_DISPLAY_NAME}, entityId=${SEAT_ENTITY_ID})...`
+    `🚀 Calling booking API for seat ${SEAT_NUMBER} (${seat.displayName}, entityId=${seat.id})...`
   );
 
   // Add browser-like headers (helps some setups)
@@ -411,6 +541,19 @@ async function bookSeatViaApi(context, { userId, targetLocalDate }) {
   page.on("response", async (res) => {
     try {
       const url = res.url();
+      if (url.includes("/amenitybooking/entity/availabilityMapViewForListOfDaysOptimized")) {
+        const json = await res.json().catch(() => null);
+        const value = json?.response?.value ?? json?.response ?? json?.value ?? json;
+        if (value) {
+          const entities = extractEntitiesFromMapValue(value);
+          if (entities.length > 0) {
+            lastMapEntities = mergeEntities(lastMapEntities, entities);
+            if (VERBOSE) {
+              logStep(`Map entities captured: ${lastMapEntities.length}`);
+            }
+          }
+        }
+      }
       if (!url.includes("/ems/user/myProfile")) return;
       // Only parse when OK
       if (!res.ok()) return;
@@ -545,13 +688,21 @@ async function bookSeatViaApi(context, { userId, targetLocalDate }) {
     const userId = await waitForCapturedUserId(30_000);
     logStep(`Resolved userId=${userId}`);
 
-    // 7) Book seat via API
+    // 7) Resolve seat from map data (unless entity id is provided)
+    const resolvedSeat = await resolveSeatFromMap();
+    logStep(`Resolved seat: ${resolvedSeat.displayName} (id=${resolvedSeat.id})`);
+
+    // 8) Book seat via API
     if (Object.keys(capturedAmenityHeaders).length === 0) {
       logStep("⚠️ No amenity headers captured; booking may fail.");
     }
-    await bookSeatViaApi(context, { userId, targetLocalDate });
+    await bookSeatViaApi(context, {
+      userId,
+      targetLocalDate,
+      seat: resolvedSeat,
+    });
 
-    logStep("✅ Completed booking via API (seat 171).");
+    logStep(`✅ Completed booking via API (seat ${SEAT_NUMBER}).`);
 
   } catch (e) {
     console.error(`[${ts()}] ❌ Failed:`, e);

@@ -29,9 +29,9 @@ jobs:
           SMARTEN_USER: ${{ secrets.SMARTEN_USER }}
           SMARTEN_PASS: ${{ secrets.SMARTEN_PASS }}
           DAYS_AHEAD: "14"
-          SEAT_NUMBER: ${{ secrets.SEAT_NUMBER }}
-          SEAT_FALLBACKS: ${{ secrets.SEAT_FALLBACKS }}
-          START_TIME_LABEL: ${{ secrets.START_TIME_LABEL }}
-          END_TIME_LABEL: ${{ secrets.END_TIME_LABEL }}
+          SEAT_NUMBER: ${{ vars.SEAT_NUMBER }}
+          SEAT_FALLBACKS: ${{ vars.SEAT_FALLBACKS }}
+          START_TIME_LABEL: ${{ vars.START_TIME_LABEL }}
+          END_TIME_LABEL: ${{ vars.END_TIME_LABEL }}
           HEADFUL: "0"
         run: node scripts/book-seat.js

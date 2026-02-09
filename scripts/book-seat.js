@@ -94,16 +94,59 @@ async function safeFill(locator, value, timeout = 30_000) {
 /* ----------------------------
  * Date helpers
  * ---------------------------- */
-function addDays(date, days) {
-  const d = new Date(date);
-  d.setDate(d.getDate() + days);
-  return d;
+const MONTH_NAMES = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+function getSgtYmd(daysAhead = 0) {
+  const SGT_OFFSET_MS = 8 * 60 * 60 * 1000;
+  const nowSgt = new Date(Date.now() + SGT_OFFSET_MS);
+  const base = new Date(
+    Date.UTC(nowSgt.getUTCFullYear(), nowSgt.getUTCMonth(), nowSgt.getUTCDate())
+  );
+  base.setUTCDate(base.getUTCDate() + daysAhead);
+  return {
+    y: base.getUTCFullYear(),
+    m: base.getUTCMonth(),
+    d: base.getUTCDate(),
+  };
 }
-function monthYearLabel(d) {
-  return d.toLocaleString("en-US", { month: "long", year: "numeric" });
+
+function monthYearLabelFromYmd({ y, m }) {
+  return `${MONTH_NAMES[m]} ${y}`;
 }
-function dayNum(d) {
-  return d.getDate();
+
+function dateObjFromYmd({ y, m, d }) {
+  return new Date(Date.UTC(y, m, d));
+}
+
+function fmtYmd({ y, m, d }) {
+  const mm = String(m + 1).padStart(2, "0");
+  const dd = String(d).padStart(2, "0");
+  return `${y}-${mm}-${dd}`;
+}
+
+function fmtSgtNow() {
+  const SGT_OFFSET_MS = 8 * 60 * 60 * 1000;
+  const now = new Date(Date.now() + SGT_OFFSET_MS);
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const d = now.getUTCDate();
+  const hh = String(now.getUTCHours()).padStart(2, "0");
+  const mm = String(now.getUTCMinutes()).padStart(2, "0");
+  const ss = String(now.getUTCSeconds()).padStart(2, "0");
+  return `${fmtYmd({ y, m, d })} ${hh}:${mm}:${ss}`;
 }
 
 // Payload expects UTC midnight ms for that calendar date
@@ -207,11 +250,11 @@ async function clickDayCell(page, day) {
 }
 
 async function pickDateDaysAhead(page, daysAhead) {
-  const target = addDays(new Date(), daysAhead);
-  const targetLabel = monthYearLabel(target);
-  const targetDay = dayNum(target);
+  const targetYmd = getSgtYmd(daysAhead);
+  const targetLabel = monthYearLabelFromYmd(targetYmd);
+  const targetDay = targetYmd.d;
 
-  logStep(`Target booking date: ${target.toDateString()} (${targetLabel})`);
+  logStep(`Target booking date (SGT): ${fmtYmd(targetYmd)} (${targetLabel})`);
 
   const calendarIcon = page.locator(".cursor-pointer.iconSize").first();
   await safeWaitVisible(calendarIcon, 60_000);
@@ -223,7 +266,7 @@ async function pickDateDaysAhead(page, daysAhead) {
   logStep(`Selecting day: ${targetDay}`);
   await clickDayCell(page, targetDay);
 
-  return target;
+  return dateObjFromYmd(targetYmd);
 }
 
 /* ----------------------------
@@ -540,6 +583,7 @@ function isSeatTakenError(err) {
   logStep(
     `Starting booking run (seat=${SEAT_NUMBER}, ${START_TIME_LABEL} -> ${END_TIME_LABEL}, daysAhead=${DAYS_AHEAD})`
   );
+  logStep(`Now (SGT): ${fmtSgtNow()}`);
 
   const browser = await chromium.launch({
     headless: !HEADFUL,

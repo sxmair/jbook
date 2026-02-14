@@ -30,6 +30,9 @@ const SEAT_FALLBACKS = (process.env.SEAT_FALLBACKS || "")
 const HEADFUL = process.env.HEADFUL === "1";
 const SLOWMO = Number(process.env.SLOWMO || "0");
 const VERBOSE = process.env.VERBOSE === "1";
+const BOOK_AT_SGT = process.env.BOOK_AT_SGT || null; // e.g. "00:00" or "00:00:00"
+const WAIT_BEFORE_BOOK = process.env.WAIT_BEFORE_BOOK === "1";
+const BLOCK_ASSETS = process.env.BLOCK_ASSETS !== "0";
 
 if (!USER || !PASS) {
   console.error("Missing SMARTEN_USER / SMARTEN_PASS");
@@ -147,6 +150,66 @@ function fmtSgtNow() {
   const mm = String(now.getUTCMinutes()).padStart(2, "0");
   const ss = String(now.getUTCSeconds()).padStart(2, "0");
   return `${fmtYmd({ y, m, d })} ${hh}:${mm}:${ss}`;
+}
+
+function parseHhmmss(value) {
+  const s = String(value || "").trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) throw new Error(`Bad time format: "${value}" (expected HH:MM or HH:MM:SS)`);
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  const ss = Number(m[3] || "0");
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 59) {
+    throw new Error(`Bad time value: "${value}"`);
+  }
+  return { hh, mm, ss };
+}
+
+function getSgtNowParts() {
+  const SGT_OFFSET_MS = 8 * 60 * 60 * 1000;
+  const now = new Date(Date.now() + SGT_OFFSET_MS);
+  return {
+    y: now.getUTCFullYear(),
+    m: now.getUTCMonth(),
+    d: now.getUTCDate(),
+    hh: now.getUTCHours(),
+    mm: now.getUTCMinutes(),
+    ss: now.getUTCSeconds(),
+  };
+}
+
+function nextSgtTimestampMs(hh, mm, ss) {
+  const now = getSgtNowParts();
+  let target = new Date(Date.UTC(now.y, now.m, now.d, hh, mm, ss, 0));
+  const nowMs = Date.UTC(now.y, now.m, now.d, now.hh, now.mm, now.ss, 0);
+  if (target.getTime() <= nowMs) {
+    target = new Date(Date.UTC(now.y, now.m, now.d + 1, hh, mm, ss, 0));
+  }
+  return target.getTime() - 8 * 60 * 60 * 1000; // back to UTC epoch ms
+}
+
+async function waitUntilSgtTime(label) {
+  const { hh, mm, ss } = parseHhmmss(label);
+  const targetUtcMs = nextSgtTimestampMs(hh, mm, ss);
+  const targetSgt = new Date(targetUtcMs + 8 * 60 * 60 * 1000);
+  logStep(
+    `Waiting until SGT ${String(hh).padStart(2, "0")}:${String(mm).padStart(
+      2,
+      "0"
+    )}:${String(ss).padStart(2, "0")} (target ${fmtYmd({
+      y: targetSgt.getUTCFullYear(),
+      m: targetSgt.getUTCMonth(),
+      d: targetSgt.getUTCDate(),
+    })})`
+  );
+
+  for (;;) {
+    const now = Date.now();
+    const remaining = targetUtcMs - now;
+    if (remaining <= 0) break;
+    const sleepMs = Math.min(remaining, 1_000);
+    await new Promise((r) => setTimeout(r, sleepMs));
+  }
 }
 
 // Payload expects UTC midnight ms for that calendar date
@@ -596,6 +659,16 @@ function isSeatTakenError(err) {
 
   const page = await context.newPage();
 
+  if (BLOCK_ASSETS) {
+    await context.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (type === "image" || type === "media" || type === "font") {
+        return route.abort();
+      }
+      return route.continue();
+    });
+  }
+
   // Capture myProfile response body to extract userId
   page.on("response", async (res) => {
     try {
@@ -699,20 +772,26 @@ function isSeatTakenError(err) {
     logStep("Clicking Book Now...");
     await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
 
-    // 3) Pick date
+    // 3) Wait for midnight (if configured) BEFORE picking date
+    if (WAIT_BEFORE_BOOK && BOOK_AT_SGT) {
+      await waitUntilSgtTime(BOOK_AT_SGT);
+      waitedForBookTime = true;
+    }
+
+    // 4) Pick date (only after midnight when date becomes available)
     logStep("Selecting booking date...");
     const targetLocalDate = await pickDateDaysAhead(page, DAYS_AHEAD);
 
     logStep("Clicking Next (to time confirmation modal)...");
     await safeClick(page.getByRole("button", { name: "Next" }), 30_000);
 
-    // 4) Select Start Time
+    // 5) Select Start Time
     logStep("Selecting Start Time...");
     await openStartTimeDropdown(page);
     await page.waitForTimeout(150);
     await pickTimeOptionRobust(page, START_TIME_LABEL, { timeout: 8000 });
 
-    // 5) Select End Time — bounded + non-blocking
+    // 6) Select End Time — bounded + non-blocking
     const endExists =
       (await page.locator("#endTime .mat-select-trigger").count().catch(() => 0)) >
       0;
@@ -742,15 +821,16 @@ function isSeatTakenError(err) {
       await proceedBtn.click().catch(() => {});
     }
 
-    // 6) Get userId from captured myProfile XHR (NO API CALL)
+    // 7) Get userId from captured myProfile XHR (NO API CALL)
     logStep("Waiting for captured userId from browser XHR...");
     const userId = await waitForCapturedUserId(30_000);
     logStep(`Resolved userId=${userId}`);
 
-    // 7) Resolve seat + book (with fallbacks)
+    // 8) Resolve seat + book (with fallbacks)
     const seatCandidates = [SEAT_NUMBER, ...SEAT_FALLBACKS];
     logStep(`Seat candidates: ${seatCandidates.join(", ")}`);
     let bookedSeat = null;
+    let waitedForBookTime = false;
 
     for (let i = 0; i < seatCandidates.length; i++) {
       const seatNum = seatCandidates[i];
@@ -765,6 +845,10 @@ function isSeatTakenError(err) {
       }
 
       try {
+        if (!waitedForBookTime && WAIT_BEFORE_BOOK && BOOK_AT_SGT) {
+          await waitUntilSgtTime(BOOK_AT_SGT);
+          waitedForBookTime = true;
+        }
         await bookSeatViaApi(context, {
           userId,
           targetLocalDate,

@@ -214,9 +214,10 @@ async function waitUntilSgtTime(label) {
 
 // Payload expects UTC midnight ms for that calendar date
 function utcMidnightMsForLocalDate(dateObj) {
-  const y = dateObj.getFullYear();
-  const m = dateObj.getMonth();
-  const d = dateObj.getDate();
+  // Use UTC fields so host timezone does not shift the booking date.
+  const y = dateObj.getUTCFullYear();
+  const m = dateObj.getUTCMonth();
+  const d = dateObj.getUTCDate();
   return Date.UTC(y, m, d, 0, 0, 0, 0);
 }
 
@@ -772,6 +773,8 @@ function isSeatTakenError(err) {
     logStep("Clicking Book Now...");
     await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
 
+    let waitedForBookTime = false;
+
     // 3) Wait for midnight (if configured) BEFORE picking date
     if (WAIT_BEFORE_BOOK && BOOK_AT_SGT) {
       await waitUntilSgtTime(BOOK_AT_SGT);
@@ -830,7 +833,6 @@ function isSeatTakenError(err) {
     const seatCandidates = [SEAT_NUMBER, ...SEAT_FALLBACKS];
     logStep(`Seat candidates: ${seatCandidates.join(", ")}`);
     let bookedSeat = null;
-    let waitedForBookTime = false;
 
     for (let i = 0; i < seatCandidates.length; i++) {
       const seatNum = seatCandidates[i];

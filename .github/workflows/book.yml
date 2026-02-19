@@ -33,7 +33,7 @@ jobs:
           SEAT_FALLBACKS: ${{ vars.SEAT_FALLBACKS }}
           START_TIME_LABEL: ${{ vars.START_TIME_LABEL }}
           END_TIME_LABEL: ${{ vars.END_TIME_LABEL }}
-          WAIT_BEFORE_BOOK: ${{ WAIT_BEFORE_BOOK }}
-          BOOK_AT_SGT: ${{ BOOK_AT_SGT }}
+          WAIT_BEFORE_BOOK: ${{ vars.WAIT_BEFORE_BOOK }}
+          BOOK_AT_SGT: ${{ vars.BOOK_AT_SGT }}
           HEADFUL: "0"
         run: node scripts/book-seat.js

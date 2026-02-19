@@ -3,7 +3,7 @@ name: Auto book seat
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 16 * * 0-4"  # 16:00 UTC Sun-Thu = 00:00 SGT Mon-Fri
+    - cron: "30 13 * * *"  # 13:30 UTC daily = 21:30 SGT daily
 
 jobs:
   book:

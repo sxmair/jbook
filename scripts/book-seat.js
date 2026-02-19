@@ -33,6 +33,8 @@ const VERBOSE = process.env.VERBOSE === "1";
 const BOOK_AT_SGT = process.env.BOOK_AT_SGT || null; // e.g. "00:00" or "00:00:00"
 const WAIT_BEFORE_BOOK = process.env.WAIT_BEFORE_BOOK === "1";
 const BLOCK_ASSETS = process.env.BLOCK_ASSETS !== "0";
+const PREOPEN_BOOKING = process.env.PREOPEN_BOOKING === "1";
+const UI_SETTLE_MS = Number(process.env.UI_SETTLE_MS || "40");
 
 if (!USER || !PASS) {
   console.error("Missing SMARTEN_USER / SMARTEN_PASS");
@@ -252,61 +254,169 @@ function toHHmm(label) {
  * ---------------------------- */
 async function getCurrentMonthLabel(page) {
   const monthRegex =
-    /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}/;
+    /(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*,?\s+\d{4}/i;
+  const monthToIndex = {
+    jan: 0,
+    feb: 1,
+    mar: 2,
+    apr: 3,
+    may: 4,
+    jun: 5,
+    jul: 6,
+    aug: 7,
+    sep: 8,
+    oct: 9,
+    nov: 10,
+    dec: 11,
+  };
 
-  const candidates = page.locator(`text=${monthRegex}`);
+  const normalizeMonthYear = (text) => {
+    const t = String(text || "").trim().replace(/\s+/g, " ");
+    const m = t.match(monthRegex);
+    if (!m) return null;
+    const hit = m[0].replace(",", " ");
+    const p = hit.match(/^([A-Za-z]+)\s+(\d{4})$/);
+    if (!p) return null;
+    const mon = p[1].slice(0, 3).toLowerCase();
+    const y = Number(p[2]);
+    const idx = monthToIndex[mon];
+    if (idx == null || !Number.isFinite(y)) return null;
+    return `${MONTH_NAMES[idx]} ${y}`;
+  };
+
+  const periodBtn = page
+    .locator("button.mat-calendar-period-button, .mat-calendar-period-button")
+    .first();
+  if ((await periodBtn.count().catch(() => 0)) > 0) {
+    const t = (await periodBtn.innerText().catch(() => ""))
+      .trim()
+      .replace(/\s+/g, " ");
+    const norm = normalizeMonthYear(t);
+    if (norm) return norm;
+  }
+
+  const candidates = page.locator("button, div, span").filter({
+    hasText: monthRegex,
+  });
   const n = await candidates.count().catch(() => 0);
-
   for (let i = 0; i < n; i++) {
     const t = (await candidates.nth(i).innerText().catch(() => ""))
       .trim()
       .replace(/\s+/g, " ");
-    if (monthRegex.test(t) && t.length <= 30) return t;
+    const norm = normalizeMonthYear(t);
+    if (norm) return norm;
   }
+
   return null;
 }
 
 async function navigateToMonth(page, targetLabel) {
-  for (let tries = 0; tries < 24; tries++) {
+  function monthIndexFromLabel(label) {
+    const m = String(label || "").trim().match(
+      /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$/i
+    );
+    if (!m) return null;
+    const monthIdx = MONTH_NAMES.findIndex(
+      (name) => name.toLowerCase() === m[1].toLowerCase()
+    );
+    if (monthIdx < 0) return null;
+    return Number(m[2]) * 12 + monthIdx;
+  }
+
+  async function tryClickNav(which) {
+    const isNext = which === "next";
+    const iconText = isNext ? "navigate_next" : "navigate_before";
+    const selectors = isNext
+      ? [
+          "button.mat-calendar-next-button",
+          ".mat-calendar-next-button",
+          '[aria-label*="next month" i]',
+          '[aria-label*="next" i]',
+        ]
+      : [
+          "button.mat-calendar-previous-button",
+          ".mat-calendar-previous-button",
+          '[aria-label*="previous month" i]',
+          '[aria-label*="previous" i]',
+          '[aria-label*="prev" i]',
+        ];
+
+    for (const sel of selectors) {
+      const loc = page.locator(sel).first();
+      if ((await loc.count().catch(() => 0)) > 0) {
+        try {
+          await loc.click({ timeout: 1200 });
+          return true;
+        } catch {}
+      }
+    }
+
+    // Fallback from your codegen: icon text nodes can be directly clickable.
+    const icon = page.getByText(iconText, { exact: true }).first();
+    if ((await icon.count().catch(() => 0)) > 0) {
+      try {
+        await icon.click({ timeout: 1200 });
+        return true;
+      } catch {}
+      try {
+        await icon.locator("xpath=ancestor::button[1]").click({ timeout: 1200 });
+        return true;
+      } catch {}
+    }
+
+    return false;
+  }
+
+  for (let tries = 0; tries < 36; tries++) {
     const cur = await getCurrentMonthLabel(page);
     logVerbose(`Calendar month label now: "${cur}" target="${targetLabel}"`);
     if (cur && cur.toLowerCase() === targetLabel.toLowerCase()) return;
 
-    const nextBtn =
-      page.locator('button:has-text("navigate_next")').first()
-        .or(page.locator('button[aria-label*="next" i]').first())
-        .or(page.locator('button:has-text(">")').first());
-
-    const prevBtn =
-      page.locator('button:has-text("navigate_before")').first()
-        .or(page.locator('button[aria-label*="prev" i]').first())
-        .or(page.locator('button:has-text("<")').first());
+    const curIdx = monthIndexFromLabel(cur);
+    const targetIdx = monthIndexFromLabel(targetLabel);
 
     let clicked = false;
-
-    if ((await nextBtn.count().catch(() => 0)) > 0) {
-      try {
-        await nextBtn.click({ timeout: 1500 });
-        clicked = true;
-      } catch {}
+    if (curIdx != null && targetIdx != null) {
+      if (curIdx < targetIdx) {
+        clicked = await tryClickNav("next");
+      } else if (curIdx > targetIdx) {
+        clicked = await tryClickNav("prev");
+      }
     }
-    if (!clicked && (await prevBtn.count().catch(() => 0)) > 0) {
-      try {
-        await prevBtn.click({ timeout: 1500 });
-        clicked = true;
-      } catch {}
+    if (!clicked) {
+      clicked = (await tryClickNav("next")) || (await tryClickNav("prev"));
     }
-    if (!clicked) throw new Error("Could not find calendar next/prev buttons.");
+    if (!clicked) {
+      throw new Error(
+        `Could not find calendar next/prev buttons (monthHeader="${cur || "unknown"}").`
+      );
+    }
 
-    await page.waitForTimeout(150);
+    await page.waitForTimeout(UI_SETTLE_MS);
   }
 
   throw new Error(`Failed to navigate calendar to "${targetLabel}".`);
 }
 
-async function clickDayCell(page, day) {
+async function clickDayCell(page, day, targetYmd = null) {
+  if (targetYmd) {
+    const month = MONTH_NAMES[targetYmd.m];
+    const ariaRegex = new RegExp(`${month}\\s+${targetYmd.d},\\s+${targetYmd.y}`, "i");
+    const byAria = page.locator("[aria-label]");
+    const n = await byAria.count().catch(() => 0);
+    for (let i = 0; i < n; i++) {
+      const node = byAria.nth(i);
+      const aria = (await node.getAttribute("aria-label").catch(() => "")) || "";
+      if (!ariaRegex.test(aria)) continue;
+      try {
+        await node.click({ timeout: 1500 });
+        return;
+      } catch {}
+    }
+  }
+
   const cell = page
-    .locator("div")
+    .locator(".mat-calendar-body-cell-content, .mat-mdc-calendar-body-cell-content, div")
     .filter({ hasText: new RegExp(`^${day}$`) })
     .first();
   await safeWaitVisible(cell, 30_000);
@@ -323,12 +433,17 @@ async function pickDateDaysAhead(page, daysAhead) {
   const calendarIcon = page.locator(".cursor-pointer.iconSize").first();
   await safeWaitVisible(calendarIcon, 60_000);
   await safeClick(calendarIcon);
-
-  await page.waitForTimeout(200);
+  await page
+    .locator(".mat-calendar-period-button, .mat-mdc-calendar-period-button")
+    .first()
+    .waitFor({ state: "visible", timeout: 3000 })
+    .catch(async () => {
+      await page.waitForTimeout(Math.max(UI_SETTLE_MS, 60));
+    });
   await navigateToMonth(page, targetLabel);
 
   logStep(`Selecting day: ${targetDay}`);
-  await clickDayCell(page, targetDay);
+  await clickDayCell(page, targetDay, targetYmd);
 
   return dateObjFromYmd(targetYmd);
 }
@@ -351,6 +466,10 @@ function normalizeText(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
 
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function pickTimeOptionRobust(page, label, { timeout = 8000 } = {}) {
   const panelOptions = page.locator(".cdk-overlay-container mat-option");
   await panelOptions.first().waitFor({ state: "visible", timeout });
@@ -359,6 +478,15 @@ async function pickTimeOptionRobust(page, label, { timeout = 8000 } = {}) {
   if (count === 0) throw new Error("No mat-option items found in overlay.");
 
   const want = normalizeText(label).toLowerCase();
+
+  // Fast path: direct locator match usually beats scanning all options.
+  const exactMatcher = new RegExp(`^\\s*${escapeRegex(label)}\\s*$`, "i");
+  const exact = panelOptions.filter({ hasText: exactMatcher }).first();
+  if ((await exact.count().catch(() => 0)) > 0) {
+    await exact.click({ timeout: 2000 });
+    await page.keyboard.press("Escape").catch(() => {});
+    return true;
+  }
 
   // 1) exact match
   for (let i = 0; i < Math.min(count, 200); i++) {
@@ -415,7 +543,7 @@ async function waitForCapturedUserId(timeoutMs = 30_000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (CAPTURED_USER_ID) return CAPTURED_USER_ID;
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 80));
   }
   throw new Error("Timed out waiting for captured userId from /ems/user/myProfile");
 }
@@ -496,7 +624,7 @@ async function waitForMapEntities(timeoutMs = 30_000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (lastMapEntities.length > 0) return lastMapEntities;
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 80));
   }
   throw new Error("Timed out waiting for map entities from availability data.");
 }
@@ -766,22 +894,32 @@ function isSeatTakenError(err) {
       .getByRole("link", { name: "Booking" })
       .waitFor({ timeout: 60_000 });
 
-    // 2) Booking -> Book Now
-    logStep("Opening Booking...");
-    await safeClick(page.getByRole("link", { name: "Booking" }), 30_000);
-
-    logStep("Clicking Book Now...");
-    await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
-
     let waitedForBookTime = false;
+    let bookingScreenReady = false;
 
-    // 3) Wait for midnight (if configured) BEFORE picking date
+    if (PREOPEN_BOOKING) {
+      logStep("Pre-opening Booking/Book Now before wait for faster trigger execution...");
+      await safeClick(page.getByRole("link", { name: "Booking" }), 30_000);
+      await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
+      bookingScreenReady = true;
+    }
+
+    // 2) Wait for trigger time first, so all date logic is based on post-wait SGT date.
     if (WAIT_BEFORE_BOOK && BOOK_AT_SGT) {
       await waitUntilSgtTime(BOOK_AT_SGT);
       waitedForBookTime = true;
     }
 
-    // 4) Pick date (only after midnight when date becomes available)
+    // 3) Booking -> Book Now
+    if (!bookingScreenReady) {
+      logStep("Opening Booking...");
+      await safeClick(page.getByRole("link", { name: "Booking" }), 30_000);
+
+      logStep("Clicking Book Now...");
+      await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
+    }
+
+    // 4) Pick date (computed from current SGT date at selection time)
     logStep("Selecting booking date...");
     const targetLocalDate = await pickDateDaysAhead(page, DAYS_AHEAD);
 
@@ -791,7 +929,6 @@ function isSeatTakenError(err) {
     // 5) Select Start Time
     logStep("Selecting Start Time...");
     await openStartTimeDropdown(page);
-    await page.waitForTimeout(150);
     await pickTimeOptionRobust(page, START_TIME_LABEL, { timeout: 8000 });
 
     // 6) Select End Time — bounded + non-blocking
@@ -803,7 +940,6 @@ function isSeatTakenError(err) {
       logStep("Selecting End Time...");
       try {
         await openEndTimeDropdown(page);
-        await page.waitForTimeout(150);
         await pickTimeOptionRobust(page, END_TIME_LABEL, { timeout: 8000 });
       } catch (e) {
         console.log(

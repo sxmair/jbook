@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "book": "node scripts/book.js",
+    "book": "node scripts/book-seat.js",
     "pw:install": "playwright install --with-deps chromium",
     "pw:codegen": "playwright codegen https://juliusbaer.smartenspaces.com/spacemanagementV2/#/login"
   },

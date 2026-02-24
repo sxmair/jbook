@@ -89,8 +89,60 @@ function hasHeader(headers, name) {
 async function safeWaitVisible(locator, timeout = 60_000) {
   await locator.waitFor({ state: "visible", timeout });
 }
+async function waitForUiNotBlocked(page, timeout = 10_000) {
+  const selectors = [
+    "app-loader .spinner-container",
+    ".spinner-container.ng-star-inserted",
+    "app-loader",
+  ];
+  const deadline = Date.now() + timeout;
+  for (const selector of selectors) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return;
+    await page
+      .locator(selector)
+      .first()
+      .waitFor({ state: "hidden", timeout: remaining })
+      .catch(() => {});
+  }
+}
+async function dismissOverlayBackdrop(page) {
+  const backdrop = page.locator(".cdk-overlay-backdrop").first();
+  const visible = await backdrop.isVisible().catch(() => false);
+  if (visible) {
+    await backdrop.click({ timeout: 1200 }).catch(() => {});
+  }
+}
 async function safeClick(locator, timeout = 30_000) {
-  await locator.click({ timeout });
+  const page = locator.page();
+  const deadline = Date.now() + timeout;
+  let lastErr = null;
+  let tries = 0;
+
+  while (Date.now() < deadline) {
+    tries += 1;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+
+    await waitForUiNotBlocked(page, Math.min(remaining, 4_000));
+    try {
+      await locator.click({ timeout: Math.min(remaining, 2_000) });
+      return;
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || "");
+      const retryable =
+        msg.includes("intercepts pointer events") ||
+        msg.includes("element is not attached") ||
+        msg.includes("not visible") ||
+        msg.includes("not stable");
+      if (!retryable) throw err;
+      await page.waitForTimeout(Math.min(600, 50 * tries));
+    }
+  }
+
+  if (lastErr) throw lastErr;
+  await locator.click({ timeout: 1 });
 }
 async function safeFill(locator, value, timeout = 30_000) {
   await locator.fill(value, { timeout });
@@ -430,6 +482,8 @@ async function pickDateDaysAhead(page, daysAhead) {
 
   logStep(`Target booking date (SGT): ${fmtYmd(targetYmd)} (${targetLabel})`);
 
+  await waitForUiNotBlocked(page, 15_000);
+  await dismissOverlayBackdrop(page);
   const calendarIcon = page.locator(".cursor-pointer.iconSize").first();
   await safeWaitVisible(calendarIcon, 60_000);
   await safeClick(calendarIcon);

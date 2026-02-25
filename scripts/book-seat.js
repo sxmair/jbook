@@ -33,7 +33,6 @@ const VERBOSE = process.env.VERBOSE === "1";
 const BOOK_AT_SGT = process.env.BOOK_AT_SGT || null; // e.g. "00:00" or "00:00:00"
 const WAIT_BEFORE_BOOK = process.env.WAIT_BEFORE_BOOK === "1";
 const BLOCK_ASSETS = process.env.BLOCK_ASSETS !== "0";
-const PREOPEN_BOOKING = process.env.PREOPEN_BOOKING === "1";
 const UI_SETTLE_MS = Number(process.env.UI_SETTLE_MS || "40");
 
 if (!USER || !PASS) {
@@ -951,30 +950,17 @@ function isSeatTakenError(err) {
       .getByRole("link", { name: "Booking" })
       .waitFor({ timeout: 60_000 });
 
-    let waitedForBookTime = false;
-    let bookingScreenReady = false;
-
-    if (PREOPEN_BOOKING) {
-      logStep("Pre-opening Booking/Book Now before wait for faster trigger execution...");
-      await safeClick(page.getByRole("link", { name: "Booking" }), 30_000);
-      await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
-      bookingScreenReady = true;
-    }
-
     // 2) Wait for trigger time first, so all date logic is based on post-wait SGT date.
     if (WAIT_BEFORE_BOOK && BOOK_AT_SGT) {
       await waitUntilSgtTime(BOOK_AT_SGT);
-      waitedForBookTime = true;
     }
 
     // 3) Booking -> Book Now
-    if (!bookingScreenReady) {
-      logStep("Opening Booking...");
-      await safeClick(page.getByRole("link", { name: "Booking" }), 30_000);
+    logStep("Opening Booking...");
+    await safeClick(page.getByRole("link", { name: "Booking" }), 30_000);
 
-      logStep("Clicking Book Now...");
-      await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
-    }
+    logStep("Clicking Book Now...");
+    await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
 
     // 4) Pick date (computed from current SGT date at selection time)
     logStep("Selecting booking date...");
@@ -1040,10 +1026,6 @@ function isSeatTakenError(err) {
       }
 
       try {
-        if (!waitedForBookTime && WAIT_BEFORE_BOOK && BOOK_AT_SGT) {
-          await waitUntilSgtTime(BOOK_AT_SGT);
-          waitedForBookTime = true;
-        }
         await bookSeatViaApi(context, {
           userId,
           targetLocalDate,

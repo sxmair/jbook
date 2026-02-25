@@ -126,12 +126,15 @@ async function safeClick(locator, timeout = 30_000) {
 
     await waitForUiNotBlocked(page, Math.min(remaining, 4_000));
     try {
+      await locator.waitFor({ state: "visible", timeout: Math.min(remaining, 2_000) });
       await locator.click({ timeout: Math.min(remaining, 2_000) });
       return;
     } catch (err) {
       lastErr = err;
       const msg = String(err?.message || "");
       const retryable =
+        msg.includes("Timeout") ||
+        msg.includes("waiting for") ||
         msg.includes("intercepts pointer events") ||
         msg.includes("element is not attached") ||
         msg.includes("not visible") ||

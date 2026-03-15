@@ -32,7 +32,7 @@ const SLOWMO = Number(process.env.SLOWMO || "0");
 const VERBOSE = process.env.VERBOSE === "1";
 const BOOK_AT_SGT = process.env.BOOK_AT_SGT || null; // e.g. "00:00" or "00:00:00"
 const WAIT_BEFORE_BOOK = process.env.WAIT_BEFORE_BOOK === "1";
-const BLOCK_ASSETS = process.env.BLOCK_ASSETS !== "0";
+const BLOCK_ASSETS = process.env.BLOCK_ASSETS === "1";
 const UI_SETTLE_MS = Number(process.env.UI_SETTLE_MS || "40");
 
 if (!USER || !PASS) {
@@ -148,6 +148,77 @@ async function safeClick(locator, timeout = 30_000) {
 }
 async function safeFill(locator, value, timeout = 30_000) {
   await locator.fill(value, { timeout });
+}
+function getEmailTextbox(page) {
+  return page
+    .locator(
+      [
+        '[aria-label="Enter your email address"]',
+        '[placeholder="Enter your email address"]',
+        '[aria-label="Eg. email@domain.com"]',
+        '[placeholder="Eg. email@domain.com"]',
+        'input[type="email"]',
+      ].join(", ")
+    )
+    .first();
+}
+async function checkTermsIfPresent(page) {
+  const checkbox = page.getByRole("checkbox", { name: /I agree to the Terms and/i });
+  if ((await checkbox.count().catch(() => 0)) > 0) {
+    await checkbox.check().catch(() => {});
+    return;
+  }
+  await page.locator(".mat-checkbox-inner-container").click().catch(() => {});
+}
+function getBookingsCard(page) {
+  return page
+    .getByText(/^Bookings$/)
+    .first()
+    .locator(
+      "xpath=ancestor::*[self::button or @role='button' or contains(@class,'cursor-pointer') or contains(@class,'card') or self::div][1]"
+    );
+}
+function getTimeComboboxes(page) {
+  return page.locator("[role='combobox']").filter({ hasText: /\b(AM|PM)\b|:00\s*(AM|PM)/i });
+}
+async function openSpacesBooking(page) {
+  await safeClick(page.getByRole("link", { name: /Spaces|Booking/i }), 30_000);
+  const deadline = Date.now() + 30_000;
+
+  while (Date.now() < deadline) {
+    await waitForUiNotBlocked(page, 5_000);
+
+    const calendarIcon = page.locator("#calendarIcon, .cursor-pointer.iconSize").first();
+    if ((await calendarIcon.count().catch(() => 0)) > 0) {
+      const ready = await calendarIcon.isVisible().catch(() => false);
+      if (ready) return;
+    }
+
+    const launchCandidates = [
+      page.locator(".card.inner-card").first(),
+      page.locator("#myBookingsArrow_Desks").first(),
+      page.locator(".card-body.bottom-left").first(),
+      getBookingsCard(page),
+      page.getByText(/^Bookings$/).first(),
+      page.locator(".mr-0").first(),
+      page.getByRole("button", { name: "Book Now" }).first(),
+      page.getByText(/book now/i).first(),
+    ];
+    for (const locator of launchCandidates) {
+      if ((await locator.count().catch(() => 0)) > 0) {
+        await safeClick(locator, 30_000);
+        await waitForUiNotBlocked(page, 5_000);
+        const calendarReady = page.locator("#calendarIcon, .cursor-pointer.iconSize").first();
+        if (await calendarReady.isVisible().catch(() => false)) {
+          return;
+        }
+      }
+    }
+
+    await page.waitForTimeout(300);
+  }
+
+  throw new Error("Could not find the booking launch control after opening Spaces.");
 }
 
 /* ----------------------------
@@ -486,7 +557,7 @@ async function pickDateDaysAhead(page, daysAhead) {
 
   await waitForUiNotBlocked(page, 15_000);
   await dismissOverlayBackdrop(page);
-  const calendarIcon = page.locator(".cursor-pointer.iconSize").first();
+  const calendarIcon = page.locator("#calendarIcon, .cursor-pointer.iconSize").first();
   await safeWaitVisible(calendarIcon, 60_000);
   await safeClick(calendarIcon);
   await page
@@ -508,14 +579,18 @@ async function pickDateDaysAhead(page, daysAhead) {
  * Time dropdown selection
  * ---------------------------- */
 async function openStartTimeDropdown(page) {
-  const trigger = page.locator("#startTime .mat-select-trigger").first();
+  const byId = page.locator("#startTime .mat-select-trigger").first();
+  const trigger =
+    (await byId.count().catch(() => 0)) > 0 ? byId : getTimeComboboxes(page).first();
   await safeWaitVisible(trigger, 60_000);
-  await trigger.click();
+  await safeClick(trigger, 30_000);
 }
 async function openEndTimeDropdown(page) {
-  const trigger = page.locator("#endTime .mat-select-trigger").first();
+  const byId = page.locator("#endTime .mat-select-trigger").first();
+  const trigger =
+    (await byId.count().catch(() => 0)) > 0 ? byId : getTimeComboboxes(page).nth(1);
   await safeWaitVisible(trigger, 60_000);
-  await trigger.click();
+  await safeClick(trigger, 30_000);
 }
 
 function normalizeText(s) {
@@ -527,7 +602,9 @@ function escapeRegex(s) {
 }
 
 async function pickTimeOptionRobust(page, label, { timeout = 8000 } = {}) {
-  const panelOptions = page.locator(".cdk-overlay-container mat-option");
+  const panelOptions = page.locator(
+    ".cdk-overlay-container [role='option'], .cdk-overlay-container mat-option"
+  );
   await panelOptions.first().waitFor({ state: "visible", timeout });
 
   const count = await panelOptions.count().catch(() => 0);
@@ -924,7 +1001,7 @@ function isSeatTakenError(err) {
     logStep("Opening login page...");
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
-    const email = page.getByRole("textbox", { name: "Eg. email@domain.com" });
+    const email = getEmailTextbox(page);
     await safeWaitVisible(email, 60_000);
 
     logStep("Filling email...");
@@ -940,14 +1017,14 @@ function isSeatTakenError(err) {
     await safeFill(pw, PASS);
 
     logStep("Clicking Terms checkbox (if present)...");
-    await page.locator(".mat-checkbox-inner-container").click().catch(() => {});
+    await checkTermsIfPresent(page);
 
     logStep("Clicking Login...");
     await safeClick(page.getByRole("button", { name: "Login" }), 30_000);
 
-    logStep("Waiting for post-login UI (Booking link)...");
+    logStep("Waiting for post-login UI (Spaces link)...");
     await page
-      .getByRole("link", { name: "Booking" })
+      .getByRole("link", { name: /Spaces|Booking/i })
       .waitFor({ timeout: 60_000 });
 
     // 2) Wait for trigger time first, so all date logic is based on post-wait SGT date.
@@ -955,12 +1032,9 @@ function isSeatTakenError(err) {
       await waitUntilSgtTime(BOOK_AT_SGT);
     }
 
-    // 3) Booking -> Book Now
-    logStep("Opening Booking...");
-    await safeClick(page.getByRole("link", { name: "Booking" }), 30_000);
-
-    logStep("Clicking Book Now...");
-    await safeClick(page.getByRole("button", { name: "Book Now" }), 30_000);
+    // 3) Open seat booking panel
+    logStep("Opening Spaces...");
+    await openSpacesBooking(page);
 
     // 4) Pick date (computed from current SGT date at selection time)
     logStep("Selecting booking date...");
@@ -968,6 +1042,7 @@ function isSeatTakenError(err) {
 
     logStep("Clicking Next (to time confirmation modal)...");
     await safeClick(page.getByRole("button", { name: "Next" }), 30_000);
+    await waitForUiNotBlocked(page, 10_000);
 
     // 5) Select Start Time
     logStep("Selecting Start Time...");
@@ -976,8 +1051,8 @@ function isSeatTakenError(err) {
 
     // 6) Select End Time — bounded + non-blocking
     const endExists =
-      (await page.locator("#endTime .mat-select-trigger").count().catch(() => 0)) >
-      0;
+      (await page.locator("#endTime .mat-select-trigger").count().catch(() => 0)) > 0 ||
+      (await getTimeComboboxes(page).count().catch(() => 0)) >= 2;
 
     if (endExists) {
       logStep("Selecting End Time...");

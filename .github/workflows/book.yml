@@ -3,7 +3,7 @@ name: Auto book seat
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 13 * * *"  # 13:30 UTC daily = 21:30 SGT daily
+    - cron: "30 20 * * *"  # 20:30 UTC daily = 04:30 SGT next day (2.5h buffer before 07:00 SGT booking open)
 
 jobs:
   book:

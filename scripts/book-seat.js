@@ -317,6 +317,20 @@ function nextSgtTimestampMs(hh, mm, ss) {
 
 async function waitUntilSgtTime(label) {
   const { hh, mm, ss } = parseHhmmss(label);
+  // If today's trigger time already passed (e.g. GitHub delayed the cron),
+  // the window is open: book now for today+DAYS_AHEAD, don't roll to tomorrow.
+  const nowParts = getSgtNowParts();
+  const todayTargetMs = Date.UTC(nowParts.y, nowParts.m, nowParts.d, hh, mm, ss, 0);
+  const nowSgtMs = Date.UTC(
+    nowParts.y, nowParts.m, nowParts.d, nowParts.hh, nowParts.mm, nowParts.ss, 0
+  );
+  if (todayTargetMs <= nowSgtMs) {
+    logStep(
+      `SGT trigger ${label} already passed today (now ${fmtSgtNow()}); booking immediately.`
+    );
+    return;
+  }
+
   const targetUtcMs = nextSgtTimestampMs(hh, mm, ss);
   const targetSgt = new Date(targetUtcMs + 8 * 60 * 60 * 1000);
   logStep(

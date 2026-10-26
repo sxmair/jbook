@@ -1,858 +1,147 @@
-import { chromium } from "@playwright/test";
+import { randomUUID } from "node:crypto";
 
-const LOGIN_URL =
-  "https://juliusbaer.smartenspaces.com/spacemanagementV2/#/login";
+const env = (k, d) => process.env[k] || d;
+const { SMARTEN_USER, SMARTEN_PASS } = process.env;
+if (!SMARTEN_USER || !SMARTEN_PASS) throw new Error("Missing SMARTEN_USER / SMARTEN_PASS");
 
-const USER = process.env.SMARTEN_USER;
-const PASS = process.env.SMARTEN_PASS;
-
-// Desired seat info (entityId is optional now; we'll resolve if missing)
-const SEAT_NUMBER = process.env.SEAT_NUMBER || "171";
-const SEAT_ENTITY_ID = process.env.SEAT_ENTITY_ID
-  ? Number(process.env.SEAT_ENTITY_ID)
-  : null;
-const SEAT_DISPLAY_NAME = process.env.SEAT_DISPLAY_NAME || null;
-
-const BUILDING_ID = Number(process.env.BUILDING_ID || "10");
-const BUILDING_NAME = process.env.BUILDING_NAME || "ONE@CHANGI CITY";
-const ZONE_ID = Number(process.env.ZONE_ID || "14");
-
-const START_TIME_LABEL = process.env.START_TIME_LABEL || "09:45 AM";
-const END_TIME_LABEL = process.env.END_TIME_LABEL || "11:59 PM";
-
-const DAYS_AHEAD = Number(process.env.DAYS_AHEAD || "14");
-const SEAT_FALLBACKS = (process.env.SEAT_FALLBACKS || "")
-  .split(",")
+const BASE = "https://juliusbaer.smartenspaces.com";
+const SEATS = [env("SEAT_NUMBER", "171"), ...env("SEAT_FALLBACKS", "").split(",")]
   .map((s) => s.trim())
   .filter(Boolean);
+const START = env("START_TIME_LABEL", "09:45 AM");
+const END = env("END_TIME_LABEL", "11:59 PM");
+const DAYS_AHEAD = Number(env("DAYS_AHEAD", "14"));
+const BUILDING_ID = Number(env("BUILDING_ID", "10"));
+const BUILDING_NAME = env("BUILDING_NAME", "ONE@CHANGI CITY");
+const ZONE_ID = Number(env("ZONE_ID", "14"));
+const DRY_RUN = process.env.DRY_RUN === "1";
+const BOOK_AT_SGT = process.env.WAIT_BEFORE_BOOK === "1" ? process.env.BOOK_AT_SGT : null; // e.g. "07:00:15"
+const LOGIN_LEAD_MS = 120_000; // log in this long before BOOK_AT_SGT, so the session is fresh
+const RETRY_MS = Number(env("RETRY_SECS", "90")) * 1000; // keep trying this long after the booking time
+const RETRY_GAP_MS = 400;
 
-// Debug controls
-const HEADFUL = process.env.HEADFUL === "1";
-const SLOWMO = Number(process.env.SLOWMO || "0");
-const VERBOSE = process.env.VERBOSE === "1";
-const BOOK_AT_SGT = process.env.BOOK_AT_SGT || null; // e.g. "00:00" or "00:00:00"
-const WAIT_BEFORE_BOOK = process.env.WAIT_BEFORE_BOOK === "1";
-const BLOCK_ASSETS = process.env.BLOCK_ASSETS === "1";
-const UI_SETTLE_MS = Number(process.env.UI_SETTLE_MS || "40");
+const SGT_MS = 8 * 3600_000;
+const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
 
-if (!USER || !PASS) {
-  console.error("Missing SMARTEN_USER / SMARTEN_PASS");
-  process.exit(1);
-}
-
-/* ----------------------------
- * Logging helpers
- * ---------------------------- */
-function ts() {
-  return new Date().toISOString();
-}
-function logStep(msg) {
-  console.log(`[${ts()}] ${msg}`);
-}
-function logVerbose(msg) {
-  if (VERBOSE) console.log(`[${ts()}] ${msg}`);
-}
-
-/* ----------------------------
- * Auth header capture
- * ---------------------------- */
-let capturedAmenityHeaders = {};
-let lastMapEntities = [];
-
-function sanitizeHeaders(headers) {
-  const deny = new Set([
-    "content-length",
-    "host",
-    "connection",
-    "accept-encoding",
-    "content-type",
-    "accept",
-  ]);
-  const out = {};
-  for (const [k, v] of Object.entries(headers || {})) {
-    const key = k.toLowerCase();
-    if (deny.has(key)) continue;
-    out[key] = v;
-  }
-  return out;
-}
-
-function hasHeader(headers, name) {
-  const want = name.toLowerCase();
-  return Object.keys(headers || {}).some((k) => k.toLowerCase() === want);
-}
-
-/* ----------------------------
- * Small helpers
- * ---------------------------- */
-async function safeWaitVisible(locator, timeout = 60_000) {
-  await locator.waitFor({ state: "visible", timeout });
-}
-async function waitForUiNotBlocked(page, timeout = 10_000) {
-  const selectors = [
-    "app-loader .spinner-container",
-    ".spinner-container.ng-star-inserted",
-    "app-loader",
-  ];
-  const deadline = Date.now() + timeout;
-  for (const selector of selectors) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) return;
-    await page
-      .locator(selector)
-      .first()
-      .waitFor({ state: "hidden", timeout: remaining })
-      .catch(() => {});
-  }
-}
-async function dismissOverlayBackdrop(page) {
-  const backdrop = page.locator(".cdk-overlay-backdrop").first();
-  const visible = await backdrop.isVisible().catch(() => false);
-  if (visible) {
-    await backdrop.click({ timeout: 1200 }).catch(() => {});
-  }
-}
-async function safeClick(locator, timeout = 30_000) {
-  const page = locator.page();
-  const deadline = Date.now() + timeout;
-  let lastErr = null;
-  let tries = 0;
-
-  while (Date.now() < deadline) {
-    tries += 1;
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-
-    await waitForUiNotBlocked(page, Math.min(remaining, 4_000));
-    try {
-      await locator.waitFor({ state: "visible", timeout: Math.min(remaining, 2_000) });
-      await locator.click({ timeout: Math.min(remaining, 2_000) });
-      return;
-    } catch (err) {
-      lastErr = err;
-      const msg = String(err?.message || "");
-      const retryable =
-        msg.includes("Timeout") ||
-        msg.includes("waiting for") ||
-        msg.includes("intercepts pointer events") ||
-        msg.includes("element is not attached") ||
-        msg.includes("not visible") ||
-        msg.includes("not stable");
-      if (!retryable) throw err;
-      await page.waitForTimeout(Math.min(600, 50 * tries));
-    }
-  }
-
-  if (lastErr) throw lastErr;
-  await locator.click({ timeout: 1 });
-}
-async function safeFill(locator, value, timeout = 30_000) {
-  await locator.fill(value, { timeout });
-}
-function getEmailTextbox(page) {
-  return page
-    .locator(
-      [
-        '[aria-label="Enter your email address"]',
-        '[placeholder="Enter your email address"]',
-        '[aria-label="Eg. email@domain.com"]',
-        '[placeholder="Eg. email@domain.com"]',
-        'input[type="email"]',
-      ].join(", ")
-    )
-    .first();
-}
-async function checkTermsIfPresent(page) {
-  const checkbox = page.getByRole("checkbox", { name: /I agree to the Terms and/i });
-  if ((await checkbox.count().catch(() => 0)) > 0) {
-    await checkbox.check().catch(() => {});
-    return;
-  }
-  await page.locator(".mat-checkbox-inner-container").click().catch(() => {});
-}
-function getBookingsCard(page) {
-  return page
-    .getByText(/^Bookings$/)
-    .first()
-    .locator(
-      "xpath=ancestor::*[self::button or @role='button' or contains(@class,'cursor-pointer') or contains(@class,'card') or self::div][1]"
-    );
-}
-function getTimeComboboxes(page) {
-  return page.locator("[role='combobox']").filter({ hasText: /\b(AM|PM)\b|:00\s*(AM|PM)/i });
-}
-async function openSpacesBooking(page) {
-  await safeClick(page.getByRole("link", { name: /Spaces|Booking/i }), 30_000);
-  const deadline = Date.now() + 30_000;
-
-  while (Date.now() < deadline) {
-    await waitForUiNotBlocked(page, 5_000);
-
-    const calendarIcon = page.locator("#calendarIcon, .cursor-pointer.iconSize").first();
-    if ((await calendarIcon.count().catch(() => 0)) > 0) {
-      const ready = await calendarIcon.isVisible().catch(() => false);
-      if (ready) return;
-    }
-
-    const launchCandidates = [
-      page.locator(".card.inner-card").first(),
-      page.locator("#myBookingsArrow_Desks").first(),
-      page.locator(".card-body.bottom-left").first(),
-      getBookingsCard(page),
-      page.getByText(/^Bookings$/).first(),
-      page.locator(".mr-0").first(),
-      page.getByRole("button", { name: "Book Now" }).first(),
-      page.getByText(/book now/i).first(),
-    ];
-    for (const locator of launchCandidates) {
-      if ((await locator.count().catch(() => 0)) > 0) {
-        await safeClick(locator, 30_000);
-        await waitForUiNotBlocked(page, 5_000);
-        const calendarReady = page.locator("#calendarIcon, .cursor-pointer.iconSize").first();
-        if (await calendarReady.isVisible().catch(() => false)) {
-          return;
-        }
-      }
-    }
-
-    await page.waitForTimeout(300);
-  }
-
-  throw new Error("Could not find the booking launch control after opening Spaces.");
-}
-
-/* ----------------------------
- * Date helpers
- * ---------------------------- */
-const MONTH_NAMES = [
-  "January",
-  "February",
-  "March",
-  "April",
-  "May",
-  "June",
-  "July",
-  "August",
-  "September",
-  "October",
-  "November",
-  "December",
-];
-
-function getSgtYmd(daysAhead = 0) {
-  const SGT_OFFSET_MS = 8 * 60 * 60 * 1000;
-  const nowSgt = new Date(Date.now() + SGT_OFFSET_MS);
-  const base = new Date(
-    Date.UTC(nowSgt.getUTCFullYear(), nowSgt.getUTCMonth(), nowSgt.getUTCDate())
-  );
-  base.setUTCDate(base.getUTCDate() + daysAhead);
-  return {
-    y: base.getUTCFullYear(),
-    m: base.getUTCMonth(),
-    d: base.getUTCDate(),
-  };
-}
-
-function monthYearLabelFromYmd({ y, m }) {
-  return `${MONTH_NAMES[m]} ${y}`;
-}
-
-function dateObjFromYmd({ y, m, d }) {
-  return new Date(Date.UTC(y, m, d));
-}
-
-function fmtYmd({ y, m, d }) {
-  const mm = String(m + 1).padStart(2, "0");
-  const dd = String(d).padStart(2, "0");
-  return `${y}-${mm}-${dd}`;
-}
-
-function fmtSgtNow() {
-  const SGT_OFFSET_MS = 8 * 60 * 60 * 1000;
-  const now = new Date(Date.now() + SGT_OFFSET_MS);
-  const y = now.getUTCFullYear();
-  const m = now.getUTCMonth();
-  const d = now.getUTCDate();
-  const hh = String(now.getUTCHours()).padStart(2, "0");
-  const mm = String(now.getUTCMinutes()).padStart(2, "0");
-  const ss = String(now.getUTCSeconds()).padStart(2, "0");
-  return `${fmtYmd({ y, m, d })} ${hh}:${mm}:${ss}`;
-}
-
-function parseHhmmss(value) {
-  const s = String(value || "").trim();
-  const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  if (!m) throw new Error(`Bad time format: "${value}" (expected HH:MM or HH:MM:SS)`);
-  const hh = Number(m[1]);
-  const mm = Number(m[2]);
-  const ss = Number(m[3] || "0");
-  if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 59) {
-    throw new Error(`Bad time value: "${value}"`);
-  }
-  return { hh, mm, ss };
-}
-
-function getSgtNowParts() {
-  const SGT_OFFSET_MS = 8 * 60 * 60 * 1000;
-  const now = new Date(Date.now() + SGT_OFFSET_MS);
-  return {
-    y: now.getUTCFullYear(),
-    m: now.getUTCMonth(),
-    d: now.getUTCDate(),
-    hh: now.getUTCHours(),
-    mm: now.getUTCMinutes(),
-    ss: now.getUTCSeconds(),
-  };
-}
-
-function nextSgtTimestampMs(hh, mm, ss) {
-  const now = getSgtNowParts();
-  let target = new Date(Date.UTC(now.y, now.m, now.d, hh, mm, ss, 0));
-  const nowMs = Date.UTC(now.y, now.m, now.d, now.hh, now.mm, now.ss, 0);
-  if (target.getTime() <= nowMs) {
-    target = new Date(Date.UTC(now.y, now.m, now.d + 1, hh, mm, ss, 0));
-  }
-  return target.getTime() - 8 * 60 * 60 * 1000; // back to UTC epoch ms
-}
-
-async function waitUntilSgtTime(label) {
-  const { hh, mm, ss } = parseHhmmss(label);
-  // If today's trigger time already passed (e.g. GitHub delayed the cron),
-  // the window is open: book now for today+DAYS_AHEAD, don't roll to tomorrow.
-  const nowParts = getSgtNowParts();
-  const todayTargetMs = Date.UTC(nowParts.y, nowParts.m, nowParts.d, hh, mm, ss, 0);
-  const nowSgtMs = Date.UTC(
-    nowParts.y, nowParts.m, nowParts.d, nowParts.hh, nowParts.mm, nowParts.ss, 0
-  );
-  if (todayTargetMs <= nowSgtMs) {
-    logStep(
-      `SGT trigger ${label} already passed today (now ${fmtSgtNow()}); booking immediately.`
-    );
-    return;
-  }
-
-  const targetUtcMs = nextSgtTimestampMs(hh, mm, ss);
-  const targetSgt = new Date(targetUtcMs + 8 * 60 * 60 * 1000);
-  logStep(
-    `Waiting until SGT ${String(hh).padStart(2, "0")}:${String(mm).padStart(
-      2,
-      "0"
-    )}:${String(ss).padStart(2, "0")} (target ${fmtYmd({
-      y: targetSgt.getUTCFullYear(),
-      m: targetSgt.getUTCMonth(),
-      d: targetSgt.getUTCDate(),
-    })})`
-  );
-
-  for (;;) {
-    const now = Date.now();
-    const remaining = targetUtcMs - now;
-    if (remaining <= 0) break;
-    const sleepMs = Math.min(remaining, 1_000);
-    await new Promise((r) => setTimeout(r, sleepMs));
-  }
-}
-
-// Payload expects UTC midnight ms for that calendar date
-function utcMidnightMsForLocalDate(dateObj) {
-  // Use UTC fields so host timezone does not shift the booking date.
-  const y = dateObj.getUTCFullYear();
-  const m = dateObj.getUTCMonth();
-  const d = dateObj.getUTCDate();
-  return Date.UTC(y, m, d, 0, 0, 0, 0);
-}
-
-/* ----------------------------
- * Time helpers
- * ---------------------------- */
-function parseTimeLabelToMinutes(label) {
-  const s = label.trim().replace(/\s+/g, " ");
-  const m = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+// "09:45 AM" -> minutes since midnight
+function minutes(label) {
+  const m = label.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (!m) throw new Error(`Bad time label: "${label}"`);
-  let hh = Number(m[1]);
-  const mm = Number(m[2]);
-  const ap = m[3].toUpperCase();
+  return ((Number(m[1]) % 12) + (m[3].toUpperCase() === "PM" ? 12 : 0)) * 60 + Number(m[2]);
+}
+const hhmm = (label) => {
+  const t = minutes(label);
+  return String(Math.floor(t / 60)).padStart(2, "0") + String(t % 60).padStart(2, "0");
+};
 
-  if (ap === "AM") {
-    if (hh === 12) hh = 0;
-  } else {
-    if (hh !== 12) hh += 12;
-  }
-  return hh * 60 + mm;
+// Epoch ms of today's HH:MM[:SS] in SGT.
+function sgtToday(time) {
+  const [hh, mm, ss = 0] = time.split(":").map(Number);
+  const s = new Date(Date.now() + SGT_MS);
+  return Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate(), hh, mm, ss) - SGT_MS;
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function sleepUntil(ms) {
+  while (Date.now() < ms) await sleep(Math.min(1000, ms - Date.now()));
 }
 
-function toHHmm(label) {
-  const mins = parseTimeLabelToMinutes(label);
-  const hh = String(Math.floor(mins / 60)).padStart(2, "0");
-  const mm = String(mins % 60).padStart(2, "0");
-  return `${hh}${mm}`;
-}
-
-/* ----------------------------
- * Calendar driver
- * ---------------------------- */
-async function getCurrentMonthLabel(page) {
-  const monthRegex =
-    /(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*,?\s+\d{4}/i;
-  const monthToIndex = {
-    jan: 0,
-    feb: 1,
-    mar: 2,
-    apr: 3,
-    may: 4,
-    jun: 5,
-    jul: 6,
-    aug: 7,
-    sep: 8,
-    oct: 9,
-    nov: 10,
-    dec: 11,
-  };
-
-  const normalizeMonthYear = (text) => {
-    const t = String(text || "").trim().replace(/\s+/g, " ");
-    const m = t.match(monthRegex);
-    if (!m) return null;
-    const hit = m[0].replace(",", " ");
-    const p = hit.match(/^([A-Za-z]+)\s+(\d{4})$/);
-    if (!p) return null;
-    const mon = p[1].slice(0, 3).toLowerCase();
-    const y = Number(p[2]);
-    const idx = monthToIndex[mon];
-    if (idx == null || !Number.isFinite(y)) return null;
-    return `${MONTH_NAMES[idx]} ${y}`;
-  };
-
-  const periodBtn = page
-    .locator("button.mat-calendar-period-button, .mat-calendar-period-button")
-    .first();
-  if ((await periodBtn.count().catch(() => 0)) > 0) {
-    const t = (await periodBtn.innerText().catch(() => ""))
-      .trim()
-      .replace(/\s+/g, " ");
-    const norm = normalizeMonthYear(t);
-    if (norm) return norm;
-  }
-
-  const candidates = page.locator("button, div, span").filter({
-    hasText: monthRegex,
+async function call(path, { method = "GET", body, session, ss = {}, timeout = 20_000 } = {}) {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: {
+      "content-type": "application/json",
+      feature_key: "PRE_INVITE",
+      "ss-header": JSON.stringify({
+        version: "1.0",
+        clientKey: "ADMIN_WEB_APP",
+        correlationId: randomUUID(),
+        locale: "en",
+        ...(session && { zoneId: session.zoneId, moduleId: 12001, gecId: "1", sessionId: session.id }),
+        ...ss,
+      }),
+    },
+    body: body && JSON.stringify(body),
+    signal: AbortSignal.timeout(timeout),
   });
-  const n = await candidates.count().catch(() => 0);
-  for (let i = 0; i < n; i++) {
-    const t = (await candidates.nth(i).innerText().catch(() => ""))
-      .trim()
-      .replace(/\s+/g, " ");
-    const norm = normalizeMonthYear(t);
-    if (norm) return norm;
-  }
-
-  return null;
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${method} ${path.split("?")[0]} -> ${res.status} ${text.slice(0, 500)}`);
+  return JSON.parse(text);
 }
 
-async function navigateToMonth(page, targetLabel) {
-  function monthIndexFromLabel(label) {
-    const m = String(label || "").trim().match(
-      /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$/i
-    );
-    if (!m) return null;
-    const monthIdx = MONTH_NAMES.findIndex(
-      (name) => name.toLowerCase() === m[1].toLowerCase()
-    );
-    if (monthIdx < 0) return null;
-    return Number(m[2]) * 12 + monthIdx;
-  }
-
-  async function tryClickNav(which) {
-    const isNext = which === "next";
-    const iconText = isNext ? "navigate_next" : "navigate_before";
-    const selectors = isNext
-      ? [
-          "button.mat-calendar-next-button",
-          ".mat-calendar-next-button",
-          '[aria-label*="next month" i]',
-          '[aria-label*="next" i]',
-        ]
-      : [
-          "button.mat-calendar-previous-button",
-          ".mat-calendar-previous-button",
-          '[aria-label*="previous month" i]',
-          '[aria-label*="previous" i]',
-          '[aria-label*="prev" i]',
-        ];
-
-    for (const sel of selectors) {
-      const loc = page.locator(sel).first();
-      if ((await loc.count().catch(() => 0)) > 0) {
-        try {
-          await loc.click({ timeout: 1200 });
-          return true;
-        } catch {}
-      }
-    }
-
-    // Fallback from your codegen: icon text nodes can be directly clickable.
-    const icon = page.getByText(iconText, { exact: true }).first();
-    if ((await icon.count().catch(() => 0)) > 0) {
-      try {
-        await icon.click({ timeout: 1200 });
-        return true;
-      } catch {}
-      try {
-        await icon.locator("xpath=ancestor::button[1]").click({ timeout: 1200 });
-        return true;
-      } catch {}
-    }
-
-    return false;
-  }
-
-  for (let tries = 0; tries < 36; tries++) {
-    const cur = await getCurrentMonthLabel(page);
-    logVerbose(`Calendar month label now: "${cur}" target="${targetLabel}"`);
-    if (cur && cur.toLowerCase() === targetLabel.toLowerCase()) return;
-
-    const curIdx = monthIndexFromLabel(cur);
-    const targetIdx = monthIndexFromLabel(targetLabel);
-
-    let clicked = false;
-    if (curIdx != null && targetIdx != null) {
-      if (curIdx < targetIdx) {
-        clicked = await tryClickNav("next");
-      } else if (curIdx > targetIdx) {
-        clicked = await tryClickNav("prev");
-      }
-    }
-    if (!clicked) {
-      clicked = (await tryClickNav("next")) || (await tryClickNav("prev"));
-    }
-    if (!clicked) {
-      throw new Error(
-        `Could not find calendar next/prev buttons (monthHeader="${cur || "unknown"}").`
-      );
-    }
-
-    await page.waitForTimeout(UI_SETTLE_MS);
-  }
-
-  throw new Error(`Failed to navigate calendar to "${targetLabel}".`);
-}
-
-async function clickDayCell(page, day, targetYmd = null) {
-  if (targetYmd) {
-    const month = MONTH_NAMES[targetYmd.m];
-    const ariaRegex = new RegExp(`${month}\\s+${targetYmd.d},\\s+${targetYmd.y}`, "i");
-    const byAria = page.locator("[aria-label]");
-    const n = await byAria.count().catch(() => 0);
-    for (let i = 0; i < n; i++) {
-      const node = byAria.nth(i);
-      const aria = (await node.getAttribute("aria-label").catch(() => "")) || "";
-      if (!ariaRegex.test(aria)) continue;
-      try {
-        await node.click({ timeout: 1500 });
-        return;
-      } catch {}
+async function login() {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      // The login page sends its dropdown placeholder as adDomain.
+      const { response: u } = await call("/ems/user/login", {
+        method: "POST",
+        body: { email: SMARTEN_USER, password: SMARTEN_PASS, adDomain: "Select here" },
+      });
+      return { id: u.sessionId, userId: u.userId, zoneId: u.defaultZoneId };
+    } catch (e) {
+      if (attempt === 3 || /-> 4\d\d /.test(e.message)) throw e;
+      log(`Login attempt ${attempt} failed (${e.message}); retrying...`);
+      await sleep(5000);
     }
   }
-
-  const cell = page
-    .locator(".mat-calendar-body-cell-content, .mat-mdc-calendar-body-cell-content, div")
-    .filter({ hasText: new RegExp(`^${day}$`) })
-    .first();
-  await safeWaitVisible(cell, 30_000);
-  await safeClick(cell, 30_000);
 }
 
-async function pickDateDaysAhead(page, daysAhead) {
-  const targetYmd = getSgtYmd(daysAhead);
-  const targetLabel = monthYearLabelFromYmd(targetYmd);
-  const targetDay = targetYmd.d;
-
-  logStep(`Target booking date (SGT): ${fmtYmd(targetYmd)} (${targetLabel})`);
-
-  await waitForUiNotBlocked(page, 15_000);
-  await dismissOverlayBackdrop(page);
-  const calendarIcon = page.locator("#calendarIcon, .cursor-pointer.iconSize").first();
-  await safeWaitVisible(calendarIcon, 60_000);
-  await safeClick(calendarIcon);
-  await page
-    .locator(".mat-calendar-period-button, .mat-mdc-calendar-period-button")
-    .first()
-    .waitFor({ state: "visible", timeout: 3000 })
-    .catch(async () => {
-      await page.waitForTimeout(Math.max(UI_SETTLE_MS, 60));
-    });
-  await navigateToMonth(page, targetLabel);
-
-  logStep(`Selecting day: ${targetDay}`);
-  await clickDayCell(page, targetDay, targetYmd);
-
-  return dateObjFromYmd(targetYmd);
-}
-
-/* ----------------------------
- * Time dropdown selection
- * ---------------------------- */
-async function openStartTimeDropdown(page) {
-  const byId = page.locator("#startTime .mat-select-trigger").first();
-  const trigger =
-    (await byId.count().catch(() => 0)) > 0 ? byId : getTimeComboboxes(page).first();
-  await safeWaitVisible(trigger, 60_000);
-  await safeClick(trigger, 30_000);
-}
-async function openEndTimeDropdown(page) {
-  const byId = page.locator("#endTime .mat-select-trigger").first();
-  const trigger =
-    (await byId.count().catch(() => 0)) > 0 ? byId : getTimeComboboxes(page).nth(1);
-  await safeWaitVisible(trigger, 60_000);
-  await safeClick(trigger, 30_000);
-}
-
-function normalizeText(s) {
-  return (s || "").replace(/\s+/g, " ").trim();
-}
-
-function escapeRegex(s) {
-  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-async function pickTimeOptionRobust(page, label, { timeout = 8000 } = {}) {
-  const panelOptions = page.locator(
-    ".cdk-overlay-container [role='option'], .cdk-overlay-container mat-option"
-  );
-  await panelOptions.first().waitFor({ state: "visible", timeout });
-
-  const count = await panelOptions.count().catch(() => 0);
-  if (count === 0) throw new Error("No mat-option items found in overlay.");
-
-  const want = normalizeText(label).toLowerCase();
-
-  // Fast path: direct locator match usually beats scanning all options.
-  const exactMatcher = new RegExp(`^\\s*${escapeRegex(label)}\\s*$`, "i");
-  const exact = panelOptions.filter({ hasText: exactMatcher }).first();
-  if ((await exact.count().catch(() => 0)) > 0) {
-    await exact.click({ timeout: 2000 });
-    await page.keyboard.press("Escape").catch(() => {});
-    return true;
-  }
-
-  // 1) exact match
-  for (let i = 0; i < Math.min(count, 200); i++) {
-    const opt = panelOptions.nth(i);
-    const txt = normalizeText(await opt.innerText().catch(() => ""));
-    if (!txt) continue;
-    if (txt.toLowerCase() === want) {
-      await opt.click({ timeout: 3000 });
-      await page.keyboard.press("Escape").catch(() => {});
-      return true;
-    }
-  }
-
-  // 2) contains match
-  for (let i = 0; i < Math.min(count, 200); i++) {
-    const opt = panelOptions.nth(i);
-    const txt = normalizeText(await opt.innerText().catch(() => ""));
-    if (!txt) continue;
-    if (txt.toLowerCase().includes(want)) {
-      await opt.click({ timeout: 3000 });
-      await page.keyboard.press("Escape").catch(() => {});
-      return true;
-    }
-  }
-
-  // dump sample
-  const sample = [];
-  for (let i = 0; i < Math.min(count, 40); i++) {
-    const txt = normalizeText(
-      await panelOptions.nth(i).innerText().catch(() => "")
-    );
-    if (txt) sample.push(txt);
-  }
-  throw new Error(
-    `Time option "${label}" not found. First options: ${JSON.stringify(sample)}`
-  );
-}
-
-/* ----------------------------
- * Capture userId from browser XHR (/ems/user/myProfile)
- * ---------------------------- */
-let CAPTURED_USER_ID = null;
-
-function tryExtractUserIdFromMyProfileJson(data) {
-  // Seen shapes:
-  // { response: { userId: 1262, ... }, ... }
-  // or { userId: 1262, ... }
-  const user =
-    data?.response?.userId ? data.response : data?.userId ? data : null;
-  return user?.userId ?? null;
-}
-
-async function waitForCapturedUserId(timeoutMs = 30_000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (CAPTURED_USER_ID) return CAPTURED_USER_ID;
-    await new Promise((r) => setTimeout(r, 80));
-  }
-  throw new Error("Timed out waiting for captured userId from /ems/user/myProfile");
-}
-
-/* ----------------------------
- * Seat lookup from map data
- * ---------------------------- */
-function extractEntitiesFromMapValue(value) {
-  const out = [];
-  const seen = new Set();
-
-  const addEntity = (e) => {
-    if (!e) return;
-    if (typeof e.id === "number" && typeof e.displayName === "string") {
-      if (!seen.has(e.id)) {
-        seen.add(e.id);
-        out.push({ id: e.id, displayName: e.displayName });
-      }
-    }
+// Seats on the map for the date + time window: { all, free } as Maps of id -> displayName.
+async function seatMap(session, day) {
+  const j = await call("/amenitybooking/entity/availabilityMapViewForListOfDaysOptimized", {
+    method: "POST",
+    session,
+    body: {
+      zoneId: ZONE_ID,
+      availabilityRequestDto: [
+        {
+          zoneId: ZONE_ID,
+          request: {
+            requestDetails: {
+              userId: String(session.userId),
+              startTime: day,
+              endTime: day + 86_399_000,
+              recurringStartTime: hhmm(START),
+              recurringEndTime: hhmm(END),
+            },
+          },
+        },
+      ],
+    },
+  });
+  const v = j.response?.value ?? j.response ?? j;
+  const lists = Object.entries(v).filter(([, a]) => Array.isArray(a));
+  const toMap = (arrs) => new Map(arrs.flat().filter((e) => e?.displayName).map((e) => [e.id, e.displayName]));
+  return {
+    all: toMap(lists.map(([, a]) => a)),
+    free: toMap(lists.filter(([k]) => k === "availableEntities").map(([, a]) => a)),
+    hasFree: lists.some(([k]) => k === "availableEntities"),
   };
-
-  const addFromArray = (arr) => {
-    if (!Array.isArray(arr)) return;
-    for (const e of arr) addEntity(e);
-  };
-
-  // Prefer known top-level arrays in map payload
-  if (value && typeof value === "object") {
-    const knownKeys = [
-      "availableEntities",
-      "occupiedEntities",
-      "occupiedNotCheckedInEntities",
-      "socialDistancedEntities",
-      "disabledEntities",
-      "blockedEntities",
-      "allEntities",
-    ];
-    for (const k of knownKeys) {
-      if (Array.isArray(value[k])) addFromArray(value[k]);
-    }
-  }
-
-  // Fallback: deep scan for arrays with entity-like objects
-  if (out.length === 0) {
-    const stack = [value];
-    let steps = 0;
-    while (stack.length && steps < 8000) {
-      const cur = stack.pop();
-      steps += 1;
-      if (!cur) continue;
-      if (Array.isArray(cur)) {
-        for (const item of cur) {
-          if (item && typeof item === "object" && "id" in item && "displayName" in item) {
-            addEntity(item);
-          } else {
-            stack.push(item);
-          }
-        }
-        continue;
-      }
-      if (typeof cur === "object") {
-        for (const v of Object.values(cur)) stack.push(v);
-      }
-    }
-  }
-
-  return out;
 }
 
-function mergeEntities(existing, next) {
-  const map = new Map();
-  for (const e of existing || []) map.set(e.id, e);
-  for (const e of next || []) map.set(e.id, e);
-  return Array.from(map.values());
-}
+const findSeat = (map, n) => {
+  const want = n.toLowerCase();
+  return [...map].find(([, name]) => [want, `6-${want}`].includes(name.toLowerCase()))
+    ?? [...map].find(([, name]) => name.toLowerCase().endsWith(`-${want}`));
+};
 
-async function waitForMapEntities(timeoutMs = 30_000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (lastMapEntities.length > 0) return lastMapEntities;
-    await new Promise((r) => setTimeout(r, 80));
-  }
-  throw new Error("Timed out waiting for map entities from availability data.");
-}
-
-function normalizeSeatLabel(label) {
-  return (label || "").toString().trim().toLowerCase();
-}
-
-function buildDesiredSeatLabels(seatNumber, seatDisplayName) {
-  const labels = new Set();
-  if (seatDisplayName) labels.add(normalizeSeatLabel(seatDisplayName));
-  if (seatNumber) {
-    const n = String(seatNumber).trim();
-    labels.add(normalizeSeatLabel(n));
-    labels.add(normalizeSeatLabel(`6-${n}`));
-  }
-  return labels;
-}
-
-async function resolveSeatFromMap(seatNumber, { entityId, displayName } = {}) {
-  const entities = await waitForMapEntities(30_000);
-  const desired = buildDesiredSeatLabels(seatNumber, displayName);
-
-  if (entityId) {
-    const byId = entities.find((e) => e.id === entityId);
-    if (byId) return byId;
-    const fallbackName =
-      displayName || (seatNumber ? `6-${seatNumber}` : "UNKNOWN");
-    return { id: entityId, displayName: fallbackName };
-  }
-
-  for (const e of entities) {
-    const dn = normalizeSeatLabel(e.displayName);
-    if (desired.has(dn)) return e;
-  }
-
-  // fallback: try endsWith for seat number
-  const num = String(seatNumber || "").trim();
-  if (num) {
-    const match = entities.find((e) =>
-      normalizeSeatLabel(e.displayName).endsWith(`-${num}`)
-    );
-    if (match) return match;
-  }
-
-  throw new Error(
-    `Could not resolve seat "${seatNumber}" from map data. Found ${entities.length} entities.`
-  );
-}
-
-/* ----------------------------
- * API booking (use context.request so cookies are shared)
- * ---------------------------- */
-async function bookSeatViaApi(context, { userId, targetLocalDate, seat }) {
-  const dateStartUtcMs = utcMidnightMsForLocalDate(targetLocalDate);
-  const endMinutes = parseTimeLabelToMinutes(END_TIME_LABEL);
-  const endTimeMs = dateStartUtcMs + endMinutes * 60_000;
-
+async function book(session, day, [id, displayName]) {
   const payload = [
     {
+      isWFHRequest: true,
       requestDetails: {
-        entityInfos: [
-          {
-            id: seat.id,
-            displayName: seat.displayName,
-            specialRequest: [],
-            serviceRequestEnabled: false,
-          },
-        ],
-        startTime: dateStartUtcMs,
-        endTime: endTimeMs,
+        entityInfos: [{ id, displayName, specialRequest: [], serviceRequestEnabled: false }],
+        startTime: day,
+        endTime: day + minutes(END) * 60_000,
         demandType: "USER_DEPARTMENT",
         demandId: 1,
-        userId,
+        userId: session.userId,
         rosterId: null,
         floorId: null,
         floorName: null,
         buildingId: BUILDING_ID,
         buildingName: BUILDING_NAME,
-        recurringStartTime: toHHmm(START_TIME_LABEL),
-        recurringEndTime: toHHmm(END_TIME_LABEL),
+        recurringStartTime: hhmm(START),
+        recurringEndTime: hhmm(END),
         zoneId: ZONE_ID,
         count: null,
         featureKey: null,
@@ -861,290 +150,62 @@ async function bookSeatViaApi(context, { userId, targetLocalDate, seat }) {
         meetingCategoryId: null,
         srTicketDtoList: [],
       },
-      isWFHRequest: true,
     },
   ];
-
-  const url = `https://juliusbaer.smartenspaces.com/amenitybooking/booking/create/wfh/v3?isRosterUpdation=true&userId=${encodeURIComponent(
-    String(userId)
-  )}`;
-
-  logStep(
-    `🚀 Calling booking API for seat ${seat.displayName} (entityId=${seat.id})...`
-  );
-
-  // Add browser-like headers (helps some setups)
-  const headers = {
-    "Content-Type": "application/json",
-    Accept: "application/json",
-    ...capturedAmenityHeaders,
-  };
-  if (!hasHeader(headers, "origin")) {
-    headers.Origin = "https://juliusbaer.smartenspaces.com";
-  }
-  if (!hasHeader(headers, "referer")) {
-    headers.Referer = "https://juliusbaer.smartenspaces.com/spacemanagementV2/";
-  }
-
-  logVerbose(`Booking API headers: ${Object.keys(headers).join(", ")}`);
-  const res = await context.request.post(url, { data: payload, headers });
-
-  const body = await res.text().catch(() => "");
-  if (!res.ok()) {
-    throw new Error(
-      `Booking API failed: ${res.status()} ${res.statusText()} :: ${body.slice(
-        0,
-        1600
-      )}`
-    );
-  }
-
-  logStep(`✅ Booking API returned ${res.status()}`);
-  logVerbose(`Response: ${body.slice(0, 1500)}`);
-  return body;
+  if (DRY_RUN) return log(`DRY_RUN: would book ${displayName} (id=${id}): ${JSON.stringify(payload)}`);
+  const r = await call(`/amenitybooking/booking/create/wfh/v3?isRosterUpdation=true&userId=${session.userId}`, {
+    method: "POST",
+    session,
+    body: payload,
+    timeout: 30_000,
+  });
+  log(`Booking response: ${r.message} ${r.response?.validRequests?.[0]?.ticketId ?? ""}`);
 }
 
-function isSeatTakenError(err) {
-  const msg = (err && err.message ? err.message : String(err || "")).toLowerCase();
-  return (
-    msg.includes("got booked by someone else") ||
-    msg.includes("space you were trying to book got booked") ||
-    msg.includes("please try to book another space") ||
-    msg.includes("oops!") ||
-    (msg.includes("booking api failed") && msg.includes("500"))
-  );
-}
-
-/* ----------------------------
- * Main flow
- * ---------------------------- */
-(async () => {
-  logStep(
-    `Starting booking run (seat=${SEAT_NUMBER}, ${START_TIME_LABEL} -> ${END_TIME_LABEL}, daysAhead=${DAYS_AHEAD})`
-  );
-  logStep(`Now (SGT): ${fmtSgtNow()}`);
-
-  const browser = await chromium.launch({
-    headless: !HEADFUL,
-    slowMo: SLOWMO,
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-  });
-
-  const page = await context.newPage();
-
-  if (BLOCK_ASSETS) {
-    await context.route("**/*", (route) => {
-      const type = route.request().resourceType();
-      if (type === "image" || type === "media" || type === "font") {
-        return route.abort();
-      }
-      return route.continue();
-    });
+try {
+  // Run may start before or after the release time: wait if early, go now if late.
+  const target = BOOK_AT_SGT ? sgtToday(BOOK_AT_SGT) : Date.now();
+  if (target > Date.now()) {
+    log(`Waiting until SGT ${BOOK_AT_SGT} (login ${LOGIN_LEAD_MS / 1000}s before)...`);
+    await sleepUntil(target - LOGIN_LEAD_MS);
+  } else if (BOOK_AT_SGT) {
+    log(`SGT ${BOOK_AT_SGT} already passed; booking now.`);
   }
 
-  // Capture myProfile response body to extract userId
-  page.on("response", async (res) => {
+  const session = await login();
+  log(`Logged in (user ${session.userId}).`);
+  await sleepUntil(target);
+  const s = new Date(Date.now() + SGT_MS);
+  const day = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + DAYS_AHEAD);
+  log(`Booking ${new Date(day).toISOString().slice(0, 10)} ${START}-${END}, seats: ${SEATS.join(", ")}`);
+
+  // Before release the date is not bookable yet, and right at release seats get snapped up:
+  // each round re-reads the map and walks the seat list in priority order.
+  const deadline = Math.max(Date.now(), target) + RETRY_MS;
+  for (let round = 1; ; round++) {
     try {
-      const url = res.url();
-      if (url.includes("/amenitybooking/entity/availabilityMapViewForListOfDaysOptimized")) {
-        const json = await res.json().catch(() => null);
-        const value = json?.response?.value ?? json?.response ?? json?.value ?? json;
-        if (value) {
-          const entities = extractEntitiesFromMapValue(value);
-          if (entities.length > 0) {
-            lastMapEntities = mergeEntities(lastMapEntities, entities);
-            if (VERBOSE) {
-              logStep(`Map entities captured: ${lastMapEntities.length}`);
-            }
-          }
+      const map = await seatMap(session, day);
+      log(`Round ${round}: ${map.all.size} seats, ${map.free.size} free`);
+      for (const n of SEATS) {
+        const seat = findSeat(map.all, n);
+        if (!seat) { log(`Seat ${n}: not on map`); continue; }
+        if (map.hasFree && !map.free.has(seat[0])) { log(`Seat ${seat[1]}: taken`); continue; }
+        try {
+          await book(session, day, seat);
+          log(`Booked ${seat[1]}`);
+          process.exit(0);
+        } catch (e) {
+          log(`Seat ${seat[1]} failed: ${e.message}`);
         }
       }
-      if (!url.includes("/ems/user/myProfile")) return;
-      // Only parse when OK
-      if (!res.ok()) return;
-      const data = await res.json().catch(() => null);
-      const uid = tryExtractUserIdFromMyProfileJson(data);
-      if (uid && !CAPTURED_USER_ID) {
-        CAPTURED_USER_ID = uid;
-        logStep(`✅ Captured userId from myProfile XHR: ${CAPTURED_USER_ID}`);
-      }
-    } catch {
-      // ignore
+    } catch (e) {
+      log(`Round ${round} error: ${e.message}`);
     }
-  });
-
-  page.on("console", (msg) => {
-    if (VERBOSE) {
-      console.log(`[${ts()}] BROWSER ${msg.type()}: ${msg.text()}`);
-    }
-  });
-  page.on("pageerror", (err) => {
-    if (VERBOSE) console.log(`[${ts()}] PAGEERROR: ${err.message}`);
-  });
-  page.on("requestfailed", (req) => {
-    if (VERBOSE) {
-      console.log(
-        `[${ts()}] REQ FAILED: ${req.method()} ${req.url()} :: ${req.failure()?.errorText}`
-      );
-    }
-  });
-  page.on("request", (req) => {
-    const t = req.resourceType();
-    if (t !== "xhr" && t !== "fetch") return;
-    const url = req.url();
-    if (!url.includes("/amenitybooking/")) return;
-
-    const allAmenity = sanitizeHeaders(req.headers());
-    if (Object.keys(allAmenity).length > 0) {
-      capturedAmenityHeaders = { ...capturedAmenityHeaders, ...allAmenity };
-      logVerbose(
-        `Captured amenity headers: ${Object.keys(allAmenity).join(", ")}`
-      );
-    }
-  });
-
-  const hb = setInterval(() => {
-    if (VERBOSE) console.log(`[${ts()}] ...still running`);
-  }, 5000);
-
-  try {
-    // 1) Login
-    logStep("Opening login page...");
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
-
-    const email = getEmailTextbox(page);
-    await safeWaitVisible(email, 60_000);
-
-    logStep("Filling email...");
-    await safeFill(email, USER);
-
-    logStep("Clicking Proceed...");
-    await safeClick(page.getByRole("button", { name: "Proceed" }), 30_000);
-
-    const pw = page.getByRole("textbox", { name: "Enter Password" });
-    await safeWaitVisible(pw, 60_000);
-
-    logStep("Filling password...");
-    await safeFill(pw, PASS);
-
-    logStep("Clicking Terms checkbox (if present)...");
-    await checkTermsIfPresent(page);
-
-    logStep("Clicking Login...");
-    await safeClick(page.getByRole("button", { name: "Login" }), 30_000);
-
-    logStep("Waiting for post-login UI (Spaces link)...");
-    await page
-      .getByRole("link", { name: /Spaces|Booking/i })
-      .waitFor({ timeout: 60_000 });
-
-    // 2) Wait for trigger time first, so all date logic is based on post-wait SGT date.
-    if (WAIT_BEFORE_BOOK && BOOK_AT_SGT) {
-      await waitUntilSgtTime(BOOK_AT_SGT);
-    }
-
-    // 3) Open seat booking panel
-    logStep("Opening Spaces...");
-    await openSpacesBooking(page);
-
-    // 4) Pick date (computed from current SGT date at selection time)
-    logStep("Selecting booking date...");
-    const targetLocalDate = await pickDateDaysAhead(page, DAYS_AHEAD);
-
-    logStep("Clicking Next (to time confirmation modal)...");
-    await safeClick(page.getByRole("button", { name: "Next" }), 30_000);
-    await waitForUiNotBlocked(page, 10_000);
-
-    // 5) Select Start Time
-    logStep("Selecting Start Time...");
-    await openStartTimeDropdown(page);
-    await pickTimeOptionRobust(page, START_TIME_LABEL, { timeout: 8000 });
-
-    // 6) Select End Time — bounded + non-blocking
-    const endExists =
-      (await page.locator("#endTime .mat-select-trigger").count().catch(() => 0)) > 0 ||
-      (await getTimeComboboxes(page).count().catch(() => 0)) >= 2;
-
-    if (endExists) {
-      logStep("Selecting End Time...");
-      try {
-        await openEndTimeDropdown(page);
-        await pickTimeOptionRobust(page, END_TIME_LABEL, { timeout: 8000 });
-      } catch (e) {
-        console.log(
-          `[${ts()}] ⚠️ End time selection failed (continuing anyway): ${
-            e?.message || e
-          }`
-        );
-        await page.keyboard.press("Escape").catch(() => {});
-      }
-    } else {
-      logVerbose("No #endTime detected; skipping end time selection.");
-    }
-
-    // Click Proceed if present
-    const proceedBtn = page.getByRole("button", { name: /proceed/i });
-    if ((await proceedBtn.count().catch(() => 0)) > 0) {
-      logStep("Clicking Proceed...");
-      await proceedBtn.click().catch(() => {});
-    }
-
-    // 7) Get userId from captured myProfile XHR (NO API CALL)
-    logStep("Waiting for captured userId from browser XHR...");
-    const userId = await waitForCapturedUserId(30_000);
-    logStep(`Resolved userId=${userId}`);
-
-    // 8) Resolve seat + book (with fallbacks)
-    const seatCandidates = [SEAT_NUMBER, ...SEAT_FALLBACKS];
-    logStep(`Seat candidates: ${seatCandidates.join(", ")}`);
-    let bookedSeat = null;
-
-    for (let i = 0; i < seatCandidates.length; i++) {
-      const seatNum = seatCandidates[i];
-      const resolvedSeat = await resolveSeatFromMap(seatNum, {
-        entityId: i === 0 ? SEAT_ENTITY_ID : null,
-        displayName: i === 0 ? SEAT_DISPLAY_NAME : null,
-      });
-      logStep(`Resolved seat: ${resolvedSeat.displayName} (id=${resolvedSeat.id})`);
-
-      if (Object.keys(capturedAmenityHeaders).length === 0) {
-        logStep("⚠️ No amenity headers captured; booking may fail.");
-      }
-
-      try {
-        await bookSeatViaApi(context, {
-          userId,
-          targetLocalDate,
-          seat: resolvedSeat,
-        });
-        bookedSeat = resolvedSeat;
-        break;
-      } catch (e) {
-        if (i < seatCandidates.length - 1 && isSeatTakenError(e)) {
-          logStep(
-            `Seat ${resolvedSeat.displayName} just got booked. Trying next fallback...`
-          );
-          continue;
-        }
-        throw e;
-      }
-    }
-
-    if (!bookedSeat) {
-      throw new Error("No seat could be booked from the fallback list.");
-    }
-
-    logStep(`✅ Completed booking via API (seat ${bookedSeat.displayName}).`);
-
-  } catch (e) {
-    console.error(`[${ts()}] ❌ Failed:`, e);
-
-    process.exitCode = 1;
-  } finally {
-    clearInterval(hb);
-    await browser.close();
+    if (Date.now() + RETRY_GAP_MS > deadline) break;
+    await sleep(RETRY_GAP_MS);
   }
-})();
+  throw new Error("No seat could be booked before the retry window closed.");
+} catch (e) {
+  console.error(`[${new Date().toISOString()}] Failed:`, e.message);
+  process.exitCode = 1;
+}

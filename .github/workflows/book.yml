@@ -18,22 +18,15 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install deps
-        run: npm ci
-
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
-
       - name: Run booking
         env:
           SMARTEN_USER: ${{ secrets.SMARTEN_USER }}
           SMARTEN_PASS: ${{ secrets.SMARTEN_PASS }}
-          DAYS_AHEAD: "14"
+          DAYS_AHEAD: ${{ vars.DAYS_AHEAD || '14' }}
           SEAT_NUMBER: ${{ vars.SEAT_NUMBER }}
           SEAT_FALLBACKS: ${{ vars.SEAT_FALLBACKS }}
           START_TIME_LABEL: ${{ vars.START_TIME_LABEL }}
           END_TIME_LABEL: ${{ vars.END_TIME_LABEL }}
           WAIT_BEFORE_BOOK: ${{ vars.WAIT_BEFORE_BOOK }}
           BOOK_AT_SGT: ${{ vars.BOOK_AT_SGT }}
-          HEADFUL: "0"
         run: node scripts/book-seat.js

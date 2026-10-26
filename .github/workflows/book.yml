@@ -22,7 +22,7 @@ jobs:
         env:
           SMARTEN_USER: ${{ secrets.SMARTEN_USER }}
           SMARTEN_PASS: ${{ secrets.SMARTEN_PASS }}
-          DAYS_AHEAD: "14"
+          DAYS_AHEAD: ${{ vars.DAYS_AHEAD || '14' }}
           SEAT_NUMBER: ${{ vars.SEAT_NUMBER }}
           SEAT_FALLBACKS: ${{ vars.SEAT_FALLBACKS }}
           START_TIME_LABEL: ${{ vars.START_TIME_LABEL }}
